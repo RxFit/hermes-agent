@@ -476,3 +476,141 @@ def test_tree_format_resolves_a_root_local_defs_ref_and_still_rejects_remote_ref
     remote = _capture_backend({"properties": {"tree_format": {"$ref": "https://invalid.example/f.json"}}})
     assert remote._session.supports_input_value("get_window_state", "tree_format", "elements") is False
     assert remote_reads == []
+
+
+# ---------------------------------------------------------------------------
+# Negotiate the ACTUAL payload values (real index, real snapshot token), never placeholders.
+# ---------------------------------------------------------------------------
+
+def _send(schema: Dict[str, Any], element: Any, tokens: Dict[int, str], tool: str = "click"):
+    backend = _backend({tool: schema}, tokens=tokens)
+    res = _act(backend, tool, element)
+    sent = backend._session.call_tool.call_args.args[1] if backend._session.call_tool.called else None
+    return res, sent
+
+
+_MIXED_MIN1 = {"type": "object",
+               "properties": {"element_token": {"type": "string"},
+                              "element_index": {"type": "integer", "minimum": 1}},
+               "additionalProperties": False}
+
+
+def test_a_valid_index_is_kept_on_a_mixed_schema_with_a_positive_minimum():
+    """Manager reproduction 1: index 1 satisfies `minimum: 1`; the schema is NOT token-only."""
+    res, sent = _send(_MIXED_MIN1, 1, {1: "tok_synthetic"})
+    assert res.ok is True
+    assert sent["element_index"] == 1 and sent["element_token"] == "tok_synthetic"
+
+
+def test_an_index_the_mixed_schema_rejects_is_replaced_by_its_valid_token_or_refused():
+    res, sent = _send(_MIXED_MIN1, 0, {0: "tok_root"})
+    assert res.ok is True and sent["element_token"] == "tok_root" and "element_index" not in sent
+    res, sent = _send(_MIXED_MIN1, 0, {})
+    assert res.ok is False and res.code == "stale_element" and sent is None
+
+
+_PATTERNED = {"type": "object",
+              "properties": {"element_token": {"type": "string", "pattern": "^tok_"}},
+              "additionalProperties": False}
+
+
+def test_a_valid_patterned_token_is_attached_and_the_forbidden_index_dropped():
+    """Manager reproduction 2: 'tok_synthetic' matches the pattern the old fixed probe 'token' failed."""
+    res, sent = _send(_PATTERNED, 1, {1: "tok_synthetic"})
+    assert res.ok is True
+    assert sent["element_token"] == "tok_synthetic" and "element_index" not in sent
+
+
+@pytest.mark.parametrize(("token_schema", "good", "bad"), [
+    ({"type": "string", "pattern": "^tok_"}, "tok_synthetic", "bad_synthetic"),
+    ({"type": "string", "minLength": 6}, "abcdef", "abc"),
+    ({"type": "string", "enum": ["alpha", "beta"]}, "beta", "gamma"),
+], ids=["pattern", "minLength", "enum"])
+def test_actual_token_value_decides_acceptance_on_a_strict_token_only_schema(token_schema, good, bad):
+    schema = {"type": "object", "properties": {"element_token": token_schema}, "additionalProperties": False}
+    res, sent = _send(schema, 3, {3: good})
+    assert res.ok is True and sent["element_token"] == good and "element_index" not in sent
+    # An invalid snapshot token fails closed: no forbidden index, no downgrade, driver never called.
+    res, sent = _send(schema, 3, {3: bad})
+    assert res.ok is False and res.code == "stale_element" and sent is None
+
+
+@pytest.mark.parametrize("tool", ["click", "set_value", "scroll", "double_click"])
+def test_patterned_token_schema_works_for_every_element_action(tool):
+    res, sent = _send(_PATTERNED, 4, {4: "tok_x"}, tool=tool)
+    assert res.ok is True and sent["element_token"] == "tok_x" and "element_index" not in sent
+
+
+def test_a_token_missing_for_the_actual_index_is_refused_even_when_other_tokens_exist():
+    res, sent = _send(_PATTERNED, 2, {1: "tok_synthetic"})
+    assert res.ok is False and res.code == "stale_element" and sent is None
+
+
+# Unadvertised tokens are not sent: permitting extra properties is not declaring token support.
+_NO_TOKEN_SUPPORT = {
+    "omitted-additionalProperties": {"type": "object", "properties": {"pid": {"type": "integer"},
+                                                                      "element_index": {"type": "integer"}}},
+    "additionalProperties-true": {"type": "object", "properties": {"element_index": {"type": "integer"}},
+                                  "additionalProperties": True},
+    "index-only-no-properties-list": {"type": "object"},
+}
+
+
+@pytest.mark.parametrize("name", list(_NO_TOKEN_SUPPORT))
+def test_a_schema_that_merely_permits_extras_does_not_get_an_unadvertised_token(name):
+    res, sent = _send(_NO_TOKEN_SUPPORT[name], 5, {5: "tok_synthetic"})
+    assert res.ok is True and sent["element_index"] == 5 and "element_token" not in sent
+
+
+@pytest.mark.parametrize("name", list(_NO_TOKEN_SUPPORT))
+def test_the_legacy_capability_still_attaches_the_token_beside_the_index(name):
+    backend = _backend({"click": _NO_TOKEN_SUPPORT[name]}, tokens={5: "tok_synthetic"})
+    backend._session._capabilities["click"] = {"accessibility.element_tokens"}
+    assert backend.click(element=5).ok is True
+    sent = backend._session.call_tool.call_args.args[1]
+    assert sent["element_index"] == 5 and sent["element_token"] == "tok_synthetic"
+
+
+def test_a_token_declared_only_inside_a_composed_branch_counts_as_declared():
+    schema = {"allOf": [{"properties": {"element_token": {"type": "string", "pattern": "^tok_"}}}]}
+    res, sent = _send(schema, 5, {5: "tok_synthetic"})
+    assert res.ok is True and sent["element_index"] == 5 and sent["element_token"] == "tok_synthetic"
+
+
+# patternProperties makes a property list non-exhaustive: never infer a prohibition from it.
+_PATTERN_PROPERTIES = {"type": "object", "properties": {"element_token": {"type": "string"}},
+                       "patternProperties": {"^element_": {}}, "additionalProperties": False}
+
+
+@pytest.mark.parametrize("validator", ["available", "missing"])
+def test_pattern_properties_do_not_make_the_index_forbidden(monkeypatch, validator):
+    if validator == "missing":
+        monkeypatch.setattr("jsonschema.validators.validator_for",
+                            lambda *a, **k: (_ for _ in ()).throw(ImportError("jsonschema unavailable")))
+    res, sent = _send(_PATTERN_PROPERTIES, 5, {5: "tok_synthetic"})
+    assert res.ok is True and sent["element_index"] == 5
+    res, sent = _send(_PATTERN_PROPERTIES, 5, {})
+    assert res.ok is True and sent["element_index"] == 5 and "element_token" not in sent
+
+
+@pytest.mark.parametrize("composition", [
+    {"allOf": [{"properties": {"element_index": {"type": "integer"}}}]},
+    {"anyOf": [{"properties": {"element_index": {"type": "integer"}}}, {"type": "object"}]},
+    {"if": {"required": ["pid"]}, "then": {"properties": {"element_index": {"type": "integer"}}}},
+], ids=["allOf", "anyOf", "if-then"])
+def test_without_a_validator_a_composed_schema_is_never_called_restrictive(monkeypatch, composition):
+    monkeypatch.setattr("jsonschema.validators.validator_for",
+                        lambda *a, **k: (_ for _ in ()).throw(ImportError("jsonschema unavailable")))
+    schema = {"type": "object", "properties": {"element_token": {"type": "string"}},
+              "additionalProperties": False, **composition}
+    res, sent = _send(schema, 5, {})
+    assert res.ok is True and sent["element_index"] == 5  # acceptance unknown -> legacy, not refused
+
+
+def test_without_a_validator_a_simple_strict_schema_is_still_token_only(monkeypatch):
+    monkeypatch.setattr("jsonschema.validators.validator_for",
+                        lambda *a, **k: (_ for _ in ()).throw(ImportError("jsonschema unavailable")))
+    res, sent = _send(_PATTERNED, 1, {1: "tok_synthetic"})
+    assert res.ok is True and sent["element_token"] == "tok_synthetic" and "element_index" not in sent
+    res, sent = _send(_PATTERNED, 1, {})
+    assert res.ok is False and res.code == "stale_element" and sent is None

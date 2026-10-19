@@ -1420,8 +1420,11 @@ class _CuaDriverSession:
     def input_property_verdict(
         self, tool: str, property_name: str, sample: Any
     ) -> Optional[bool]:
-        """Positive schema evidence on whether ``property_name`` is acceptable.
+        """Positive schema evidence on whether ``sample`` is acceptable.
 
+        ``sample`` must be the ACTUAL value about to be sent (the real element
+        index or snapshot token), never a placeholder: ``pattern`` /
+        ``minLength`` / ``enum`` / ``minimum`` decide on the real value.
         ``True``/``False`` only when the complete live ``tool`` schema accepts
         or rejects an object carrying just ``{property_name: sample}``; ``None``
         when that is unknown.  In JSON Schema an omitted property stays allowed
@@ -1432,9 +1435,11 @@ class _CuaDriverSession:
         for a prohibition, and a schema that cannot accept an empty object
         (e.g. ``oneOf`` over ``required``) is unknown.  Root-local ``$ref`` is
         resolved; remote references are never fetched.  If the validator cannot
-        evaluate the schema, only a structural prohibition counts
-        (``additionalProperties: false`` with the name undeclared, or a
-        ``False`` property schema); everything else is unknown.
+        evaluate the schema, only a structural prohibition counts, and only
+        when the property list is certainly exhaustive: a ``False`` property
+        schema, or ``additionalProperties: false`` with the name undeclared and
+        no ``patternProperties`` / composition keyword at the root.  A missing
+        validator is never permission to infer more from a property list.
         """
         schema = getattr(self, "_tool_schemas", {}).get(tool)
         if not isinstance(schema, dict) or not schema:
@@ -1461,9 +1466,58 @@ class _CuaDriverSession:
         declared = isinstance(properties, dict) and property_name in properties
         if declared and properties[property_name] is False:
             return False
-        if schema.get("additionalProperties") is False and not declared:
+        if (
+            schema.get("additionalProperties") is False
+            and not declared
+            and not any(key in schema for key in self._NON_EXHAUSTIVE_KEYWORDS)
+        ):
             return False
         return None
+
+    # Root keywords that make a ``properties`` list non-exhaustive or conditional,
+    # so the structural fallback must not read ``additionalProperties: false`` as
+    # a prohibition (acceptance is then unknown without a real validator).
+    _NON_EXHAUSTIVE_KEYWORDS = (
+        "patternProperties", "allOf", "anyOf", "oneOf", "not", "if", "then", "else",
+        "$ref", "$dynamicRef", "dependentSchemas", "unevaluatedProperties",
+    )
+
+    def declares_input_property(self, tool: str, property_name: str) -> bool:
+        """Whether the live schema DECLARES ``property_name`` (not merely permits it).
+
+        Looks in ``properties`` at the root and through ``allOf`` / ``anyOf`` /
+        ``oneOf`` branches and root-local ``#/...`` ``$ref`` targets (bounded
+        depth, nothing fetched).  A ``False`` property schema is not a
+        declaration.  This is what separates "the driver supports tokens" from
+        "the schema merely tolerates extra properties", so unadvertised tokens
+        are never sent just because additional properties are allowed.
+        """
+        root = getattr(self, "_tool_schemas", {}).get(tool)
+
+        def walk(node: Any, depth: int) -> bool:
+            if depth > 8 or not isinstance(node, dict):
+                return False
+            properties = node.get("properties")
+            if (
+                isinstance(properties, dict)
+                and property_name in properties
+                and properties[property_name] is not False
+            ):
+                return True
+            for keyword in ("allOf", "anyOf", "oneOf"):
+                branches = node.get(keyword)
+                if isinstance(branches, list) and any(walk(b, depth + 1) for b in branches):
+                    return True
+            ref = node.get("$ref")
+            if isinstance(ref, str) and ref.startswith("#/"):
+                target: Any = root
+                for part in ref[2:].split("/"):
+                    key = part.replace("~1", "/").replace("~0", "~")
+                    target = target.get(key) if isinstance(target, dict) else None
+                return walk(target, depth + 1)
+            return False
+
+        return walk(root, 0)
 
     @property
     def capabilities_discovered(self) -> bool:
@@ -3322,6 +3376,15 @@ class CuaDriverBackend(ComputerUseBackend):
         verdict = probe(tool, name, sample) if callable(probe) else None
         return verdict if isinstance(verdict, bool) else None
 
+    def _declares_input(self, tool: str, name: str) -> bool:
+        """``declares_input_property`` with a ``supports_input_property`` fallback
+        for sessions that lack it (test fakes, mocks answer only with real bools)."""
+        probe = getattr(self._session, "declares_input_property", None)
+        declared = probe(tool, name) if callable(probe) else None
+        if isinstance(declared, bool):
+            return declared
+        return self._session.supports_input_property(tool, name) is True
+
     def _maybe_attach_element_token(
         self, tool: str, args: Dict[str, Any]
     ) -> Optional[ActionResult]:
@@ -3345,14 +3408,19 @@ class CuaDriverBackend(ComputerUseBackend):
         token from the latest capture (stale, superseded or never captured) is
         refused here with ``stale_element`` so it can never reach the driver,
         be re-resolved to another element, or degrade into untargeted input.
-        A schema is token-only only on POSITIVE evidence that the index is
-        forbidden (``input_property_verdict``): declaring ``element_token``
+        The index is dropped only on POSITIVE evidence that the schema rejects
+        the ACTUAL index payload (``input_property_verdict`` with the real
+        value, so ``minimum`` / ``enum`` count): declaring ``element_token``
         without listing ``element_index`` is not enough, because an omitted
         property stays allowed unless the schema forbids it. Permissive or
         unknown schemas keep the legacy behaviour (index kept beside the token,
-        a tokenless index sent as-is). A token the live schema positively
-        rejects is not attached on the schema's say-so; the older
-        ``capabilities[]`` claim still attaches it, exactly as before.
+        a tokenless index sent as-is). The token is likewise evaluated with its
+        ACTUAL value and is attached only when the schema declares
+        ``element_token`` (a schema that merely tolerates extra properties is
+        not support, so unadvertised tokens are not sent) or the older
+        ``capabilities[]`` claim advertises it, exactly as before; a declared
+        token the schema rejects (``pattern`` mismatch ...) is not sent, and
+        with a rejected index too the action is refused.
         Index ``0`` (the AXWindow root) is a valid, falsy index.
 
         Returns an ``ActionResult`` refusal to short-circuit the call, else
@@ -3364,30 +3432,38 @@ class CuaDriverBackend(ComputerUseBackend):
         # bool is an int subclass but never a valid element index.
         index = idx if type(idx) is int else None
         token = self._snapshot_tokens.get(index) if index is not None else None
-        token_verdict = self._input_verdict(tool, "element_token", "token")
-        if token_verdict is None:  # unknown: fall back to the declared name
-            accepts_token = (
-                self._session.supports_input_property(tool, "element_token") is True
-            )
-        else:
-            accepts_token = token_verdict
-        token_only = accepts_token and (
-            self._input_verdict(tool, "element_index", 0) is False
-        )
-        if token and (
-            accepts_token
-            or self._session.supports_capability(
+
+        # 1. Is the ACTUAL snapshot token attachable? Only a driver that declares
+        #    ``element_token`` (or advertises the legacy capability) ever sees one;
+        #    a schema that merely tolerates extra properties is not support.  When
+        #    the schema evaluates the real token, a rejection (pattern / minLength /
+        #    enum ...) means it is not sent; unknown falls back to the declaration.
+        attach = False
+        if token:
+            token_verdict = self._input_verdict(tool, "element_token", token)
+            if token_verdict is not False and self._declares_input(tool, "element_token"):
+                attach = True
+            elif self._session.supports_capability(
                 "accessibility.element_tokens", tool=tool
-            )
-        ):
+            ):
+                attach = True
+
+        # 2. Does the schema reject the ACTUAL index payload?  (Forbidden outright,
+        #    or its value violates e.g. ``minimum``.)  ``None`` = unknown = legacy.
+        index_rejected = self._input_verdict(tool, "element_index", idx) is False
+
+        if attach:
             args["element_token"] = token
-            if token_only:
+            if index_rejected:  # the token carries the targeting on its own
                 args.pop("element_index", None)
-        elif token_only:
+        elif index_rejected:
+            # Known-bad index and no valid token: never send it and never degrade
+            # into untargeted or coordinate input.
             return ActionResult(
                 ok=False, action=tool, code="stale_element",
                 message=(
-                    f"element {idx!r} has no token from the latest capture — "
+                    f"element {idx!r} has no valid token from the latest capture "
+                    "and the driver schema does not accept it as an index — "
                     "call capture first"
                 ),
             )
