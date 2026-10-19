@@ -2062,6 +2062,40 @@ class TestElementTokenAttachment:
         assert "5" in res.message and "capture" in res.message
         backend._session.call_tool.assert_not_called()
 
+    def test_zero_based_index_zero_carries_its_token_on_token_only_schema(self):
+        """Cua element ids are zero-based (the AXWindow root is 0); a falsy index must not skip token
+        attachment or the refusal path."""
+        backend = self._backend_with_session({})
+        backend._session.supports_input_property = lambda tool, prop: (tool, prop) == ("click", "element_token")
+        backend._snapshot_tokens = {0: "s00000001:0"}
+        backend.click(element=0, button="left")
+        _, args = backend._session.call_tool.call_args.args
+        assert args["element_token"] == "s00000001:0"
+        assert "element_index" not in args
+
+    def test_zero_index_without_token_is_refused_on_token_only_schema(self):
+        backend = self._backend_with_session({})
+        backend._session.supports_input_property = lambda tool, prop: (tool, prop) == ("click", "element_token")
+        backend._snapshot_tokens = {5: "s00000001:5"}  # latest capture has no token for 0
+        res = backend.click(element=0, button="left")
+        assert res.ok is False and res.code == "stale_element"
+        backend._session.call_tool.assert_not_called()
+
+    def test_capability_only_driver_keeps_index_beside_token(self):
+        """A driver that advertises the token only via `capabilities[]` (no inputSchema properties) is not
+        a token-only schema: the index stays, and an index without a token is not refused locally."""
+        backend = self._backend_with_session({"click": {"accessibility.element_tokens"}})
+        backend._session.supports_input_property = lambda tool, prop: False
+        backend._snapshot_tokens = {5: "s00000001:5"}
+        backend.click(element=5, button="left")
+        _, args = backend._session.call_tool.call_args.args
+        assert args["element_token"] == "s00000001:5" and args["element_index"] == 5
+        backend._session.call_tool.reset_mock()
+        backend._snapshot_tokens = {}
+        backend.click(element=5, button="left")
+        _, args = backend._session.call_tool.call_args.args
+        assert args["element_index"] == 5 and "element_token" not in args
+
 
     def test_capture_refreshes_snapshot_tokens(self):
         """A fresh capture should overwrite any stale tokens from a
