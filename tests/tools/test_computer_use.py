@@ -78,7 +78,8 @@ class TestRegistration:
     def test_cua_driver_cmd_env_override_is_resolved_dynamically(self, tmp_path, monkeypatch):
         from tools.computer_use import cua_backend
 
-        driver = tmp_path / "custom-cua-driver"
+        # Windows only resolves executables whose extension is in PATHEXT.
+        driver = tmp_path / ("custom-cua-driver.exe" if sys.platform == "win32" else "custom-cua-driver")
         driver.write_text("#!/bin/sh\nexit 0\n")
         driver.chmod(0o755)
 
@@ -1114,8 +1115,8 @@ class TestCuaDriverSessionReconnect:
             returncode = 0
             stderr = ""
             # Daemon returns a path, not inline base64.
-            stdout = ('{"element_count": 7, "tree_markdown": "- [0] AXButton",'
-                      ' "screenshot_file_path": "%s"}' % str(shot))
+            stdout = json.dumps({"element_count": 7, "tree_markdown": "- [0] AXButton",
+                                 "screenshot_file_path": str(shot)})
 
         import subprocess as _sp
         orig_run = _sp.run
@@ -1237,7 +1238,11 @@ class TestCaptureAppFilterNoMatch:
              "structuredContent": None},
         ]
 
-        backend.capture(mode="ax")
+        # The helper-window filter is Linux-only; simulate that host (without an xprop probe).
+        with patch("tools.computer_use.cua_backend.sys.platform", "linux"), patch(
+            "tools.computer_use.cua_backend._linux_x11_active_window_id", return_value=None
+        ):
+            backend.capture(mode="ax")
 
         assert backend._active_pid == 200
         assert backend._active_window_id == 2

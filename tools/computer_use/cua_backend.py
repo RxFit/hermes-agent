@@ -1390,6 +1390,33 @@ class _CuaDriverSession:
         properties = schema.get("properties") if isinstance(schema, dict) else None
         return isinstance(properties, dict) and property_name in properties
 
+    def supports_input_value(self, tool: str, property_name: str, value: Any) -> bool:
+        """Return whether the live schema accepts ``value`` for ``property_name``.
+
+        Property presence alone is not enough for enums such as
+        ``get_window_state.tree_format``.  Validation never fetches remote
+        ``$ref`` targets; a missing/invalid schema or an unavailable validator
+        fails closed so the legacy request shape is kept.
+        """
+        if not self.supports_input_property(tool, property_name):
+            return False
+        schema = self._tool_schemas[tool]
+        try:
+            from jsonschema.validators import validator_for
+            from referencing import Registry
+
+            validator = validator_for(schema)
+            validator.check_schema(schema)
+            return validator(schema, registry=Registry()).evolve(
+                schema=schema["properties"][property_name]
+            ).is_valid(value)
+        except Exception:
+            logger.debug(
+                "cua-driver input value schema validation failed for %s.%s",
+                tool, property_name, exc_info=True,
+            )
+            return False
+
     @property
     def capabilities_discovered(self) -> bool:
         """True once ``tools/list`` populated the per-tool map. When False,
@@ -1511,6 +1538,7 @@ class _CuaDriverSession:
         self._started = False
         # Clear stale capability state; the next start populates from scratch.
         self._capabilities = {}
+        self._tool_schemas = {}
         self._capability_version = ""
         self._start_lifecycle_locked()
         self._started = True
@@ -2097,6 +2125,28 @@ class CuaDriverBackend(ComputerUseBackend):
             )
         return out
 
+    def _gws_args(self, *, structured: bool = False) -> Dict[str, Any]:
+        """``get_window_state`` arguments for the active target.
+
+        Cua >= 0.35 defaults to compact Markdown without element tokens or
+        frames, so ax/som captures (``structured=True``) ask for the
+        structured ``elements`` view, but only when the live schema positively
+        accepts that value; every other driver keeps the legacy request.  The
+        same dict feeds the MCP call and the CLI re-fetch so both transports
+        negotiate the same view.
+        """
+        args: Dict[str, Any] = {
+            "pid": self._active_pid,
+            "window_id": self._active_window_id,
+            "session": self._session_id,
+        }
+        # ``is True``: only a real positive answer counts, never a truthy stand-in.
+        if structured and self._session.supports_input_value(
+            "get_window_state", "tree_format", "elements"
+        ) is True:
+            args["tree_format"] = "elements"
+        return args
+
     def _load_windows(self) -> List[Dict[str, Any]]:
         """Load normalized visible windows, with the shared CLI recovery path.
 
@@ -2390,14 +2440,7 @@ class CuaDriverBackend(ComputerUseBackend):
                     sc_out = None
 
             if sc_out is None:
-                gws_out = self._call_capture_tool(
-                    "get_window_state",
-                    {
-                        "pid": self._active_pid,
-                        "window_id": self._active_window_id,
-                        "session": self._session_id,
-                    },
-                )
+                gws_out = self._call_capture_tool("get_window_state", self._gws_args())
                 png_b64, image_mime_type = _image_from_tool_result(gws_out)
                 # Still grab the window title — it's cheap and useful in the
                 # vision response — but deliberately leave `elements` empty so
@@ -2419,13 +2462,7 @@ class CuaDriverBackend(ComputerUseBackend):
                 )
                 try:
                     cli_out = self._session._call_tool_via_cli(
-                        "get_window_state",
-                        {
-                            "pid": self._active_pid,
-                            "window_id": self._active_window_id,
-                            "session": self._session_id,
-                        },
-                        30.0,
+                        "get_window_state", self._gws_args(), 30.0,
                     )
                     if cli_out.get("isError") is True:
                         self._clear_active_target()
@@ -2437,15 +2474,11 @@ class CuaDriverBackend(ComputerUseBackend):
                         "cua-driver CLI re-fetch for vision screenshot failed: %s", cli_exc,
                     )
         else:
-            # get_window_state: AX tree + screenshot.
-            gws_out = self._call_capture_tool(
-                "get_window_state",
-                {
-                    "pid": self._active_pid,
-                    "window_id": self._active_window_id,
-                    "session": self._session_id,
-                },
-            )
+            # get_window_state: AX tree + screenshot. The structured view (when
+            # the live schema accepts it) carries the tokens and frames that
+            # semantic targeting needs; MCP and the CLI re-fetch share the args.
+            gws_args = self._gws_args(structured=True)
+            gws_out = self._call_capture_tool("get_window_state", gws_args)
             # The persistent MCP session can return a degenerate result —
             # empty/partial data with NO exception — when the bridge is flaky
             # (e.g. it reconnected mid-call and dropped the heavy
@@ -2476,13 +2509,7 @@ class CuaDriverBackend(ComputerUseBackend):
                 )
                 try:
                     cli_out = self._session._call_tool_via_cli(
-                        "get_window_state",
-                        {
-                            "pid": self._active_pid,
-                            "window_id": self._active_window_id,
-                            "session": self._session_id,
-                        },
-                        30.0,
+                        "get_window_state", gws_args, 30.0,
                     )
                     if cli_out.get("isError") is True:
                         self._clear_active_target()
@@ -2523,10 +2550,18 @@ class CuaDriverBackend(ComputerUseBackend):
             # build — _image_from_tool_result handles both.
             png_b64, image_mime_type = _image_from_tool_result(gws_out)
 
-            # Extract window title from the AX tree first AXWindow line.
+            # Extract window title from the AX tree first AXWindow line. An
+            # elements-only response has no Markdown tree, so fall back to the
+            # driver's structured window_title, then the AXWindow element label.
             wt = re.search(r'AXWindow\s+"([^"]+)"', tree)
             if wt:
                 window_title = wt.group(1)
+            else:
+                sc_title = (gws_out.get("structuredContent") or {}).get("window_title")
+                window_title = (
+                    sc_title if isinstance(sc_title, str) and sc_title
+                    else next((e.label for e in elements if e.role == "AXWindow" and e.label), "")
+                )
 
         png_bytes_len = 0
         if png_b64:
@@ -2755,7 +2790,12 @@ class CuaDriverBackend(ComputerUseBackend):
             "direction": direction,
             "amount": max(1, min(50, amount)),
         }
-        if element is not None and self._active_window_id is not None:
+        if element is not None:
+            # Fail closed: an element request must never fall through to a
+            # coordinate or bare-window scroll when its window is unknown.
+            if self._active_window_id is None:
+                return ActionResult(ok=False, action="scroll",
+                                    message="No active window_id for element scroll.")
             args["element_index"] = element
             args["window_id"] = self._active_window_id
         elif x is not None and y is not None:
@@ -3227,7 +3267,9 @@ class CuaDriverBackend(ComputerUseBackend):
         return self._session.call_tool(name, payload, timeout=timeout)
 
     # ── Internal ───────────────────────────────────────────────────
-    def _maybe_attach_element_token(self, tool: str, args: Dict[str, Any]) -> None:
+    def _maybe_attach_element_token(
+        self, tool: str, args: Dict[str, Any]
+    ) -> Optional[ActionResult]:
         """Surface 6: when the wrapper is about to call a token-capable
         tool with `element_index`, look up the matching `element_token`
         from the last snapshot and attach it. cua-driver-rs's contract
@@ -3237,21 +3279,53 @@ class CuaDriverBackend(ComputerUseBackend):
            supplied. Returns an explicit 'stale' error if the snapshot
            has been superseded."
 
-        Gated on the per-tool capability claim so we don't send the
-        field to drivers that predate the surface (which would reject
-        the schema with `additionalProperties: false`).
+        Support is established from the live input schema first (cua-driver
+        0.21+ stopped publishing per-tool ``capabilities[]`` while still
+        accepting ``element_token``) and then from the capability claim, so
+        drivers that advertise neither never see the property.
+
+        cua-driver 0.32+ publishes strict token-only schemas
+        (``additionalProperties: false``) that name ``element_token`` but drop
+        ``element_index``: the token is sent alone, and an index with no token
+        from the latest capture (stale, superseded or never captured) is
+        refused here with ``stale_element`` so it can never reach the driver,
+        be re-resolved to another element, or degrade into untargeted input.
+        Index ``0`` (the AXWindow root) is a valid, falsy index.
+
+        Returns an ``ActionResult`` refusal to short-circuit the call, else
+        ``None``. Fakes that answer with non-bool truthy values (mocks) do not
+        count as schema support.
         """
-        idx = args.get("element_index")
-        if not isinstance(idx, int):
-            return
-        token = self._snapshot_tokens.get(idx)
-        if not token:
-            return
-        if not self._session.supports_capability(
-            "accessibility.element_tokens", tool=tool
+        if "element_index" not in args:
+            return None
+        idx = args["element_index"]
+        # bool is an int subclass but never a valid element index.
+        index = idx if type(idx) is int else None
+        token = self._snapshot_tokens.get(index) if index is not None else None
+        accepts_token = (
+            self._session.supports_input_property(tool, "element_token") is True
+        )
+        token_only = accepts_token and (
+            self._session.supports_input_property(tool, "element_index") is not True
+        )
+        if token and (
+            accepts_token
+            or self._session.supports_capability(
+                "accessibility.element_tokens", tool=tool
+            )
         ):
-            return
-        args["element_token"] = token
+            args["element_token"] = token
+            if token_only:
+                args.pop("element_index", None)
+        elif token_only:
+            return ActionResult(
+                ok=False, action=tool, code="stale_element",
+                message=(
+                    f"element {idx!r} has no token from the latest capture — "
+                    "call capture first"
+                ),
+            )
+        return None
 
     def _action(
         self,
@@ -3261,8 +3335,11 @@ class CuaDriverBackend(ComputerUseBackend):
         inject_session: bool = True,
     ) -> ActionResult:
         # Attach the snapshot's element_token whenever the call carries
-        # an element_index and the target tool advertises support.
-        self._maybe_attach_element_token(name, args)
+        # an element_index and the target tool's schema/capabilities accept
+        # it; a strict token-only schema without a token refuses locally.
+        refusal = self._maybe_attach_element_token(name, args)
+        if refusal is not None:
+            return refusal
         # Carry this run's session id so the cua-driver agent cursor
         # and per-session state (config overrides, recording ownership)
         # stay tied to this run. setdefault preserves any explicit
