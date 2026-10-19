@@ -1,0 +1,289 @@
+name: T-271 Cua backport qualification (fork only)
+
+# CI CONTROLLER ONLY. This workflow lives on ci/t271-cua-backport-qualification and is NOT part
+# of the source it tests. It checks out the frozen repair commit below (never the controller
+# branch HEAD), proves that identity, then runs the installed-base gates:
+#   * the canonical bash scripts/run_tests.sh over the computer-use tests,
+#   * `ruff check .` and scripts/check-windows-footguns.py --all (the blocking jobs in this
+#     revision's lint.yml; scripts/check does not exist at this base),
+#   * a final `git status --porcelain` cleanliness gate.
+# A green run here is a qualification of THAT frozen commit on three hosted OSes. It is NOT
+# proof of the repository's full upstream CI (tests.yml, ci.yml, docker, e2e, ... are not run).
+# No deployment, release, schedule, secret, self-hosted/paid runner or write permission is used.
+
+on:
+  push:
+    branches:
+      - ci/t271-cua-backport-qualification
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: t271-cua-backport-qualification-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  # Frozen repair commit under test and its required parent (installed base).
+  FROZEN_SHA: b7457d2b1907f3585aeb0b6f1ca935fe9f2a735b
+  BASE_SHA: efbfe0842fb99b93f37546cce406307c0f5eaec0
+
+jobs:
+  qualify:
+    name: qualify (${{ matrix.os }})
+    # Fork-only, and only from the controller branch (also bounds manual dispatch).
+    if: ${{ github.repository == 'RxFit/hermes-agent' && github.ref == 'refs/heads/ci/t271-cua-backport-qualification' }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-2025, macos-15]
+    defaults:
+      run:
+        shell: bash
+    env:
+      # Never inherit interpreter/activation state into the install or the gates.
+      PYTHONPATH: ""
+      PYTHONHOME: ""
+      __HERMES_ACTIVATED: ""
+      # Hermetic: tests must never reach real providers (no secrets are configured here anyway).
+      OPENROUTER_API_KEY: ""
+      OPENAI_API_KEY: ""
+      NOUS_API_KEY: ""
+    steps:
+      - name: Checkout frozen source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          # The frozen commit, regardless of what the controller branch HEAD is.
+          ref: ${{ env.FROZEN_SHA }}
+          # Full history so the parent/base relationship can be asserted.
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify frozen source identity
+        id: verify
+        run: |
+          set -euo pipefail
+          echo "controller (workflow) commit : ${GITHUB_SHA}"
+          echo "controller ref               : ${GITHUB_REF}"
+          head="$(git rev-parse HEAD)"
+          echo "tested source git HEAD       : ${head}"
+          echo "expected frozen SHA          : ${FROZEN_SHA}"
+          echo "expected base SHA            : ${BASE_SHA}"
+
+          fail() { echo "::error::$*"; exit 1; }
+
+          [ "${head}" = "${FROZEN_SHA}" ] || fail "checked-out HEAD ${head} != frozen SHA ${FROZEN_SHA}"
+          [ "${GITHUB_SHA}" != "${FROZEN_SHA}" ] || echo "note: controller commit equals frozen commit"
+
+          parents="$(git rev-list --parents -n 1 HEAD | cut -d' ' -f2-)"
+          echo "tested source parent(s)      : ${parents}"
+          [ "${parents}" = "${BASE_SHA}" ] || fail "frozen commit parent '${parents}' != base ${BASE_SHA}"
+
+          # The controller workflow must not be part of the tested source.
+          if [ -e .github/workflows/t271-cua-backport-qualification.yml ]; then
+            fail "controller workflow is present in the tested source tree"
+          fi
+
+          # Scope of the frozen change vs the installed base: exactly these four paths.
+          actual="$(git diff --name-only "${BASE_SHA}" "${FROZEN_SHA}" | tr -d '\r' | LC_ALL=C sort)"
+          expected="$(printf '%s\n' \
+            tests/computer_use/test_cua_wsl_manifest_path.py \
+            tests/tools/test_computer_use.py \
+            tests/tools/test_computer_use_cua_036_token_targeting.py \
+            tools/computer_use/cua_backend.py | LC_ALL=C sort)"
+          echo "changed paths vs base:"; echo "${actual}"
+          [ "${actual}" = "${expected}" ] || fail "frozen diff vs base is not the expected four paths"
+
+          dirty="$(git status --porcelain)"
+          [ -z "${dirty}" ] || fail "checkout is not clean before any step ran: ${dirty}"
+          echo "frozen source identity verified"
+
+      - name: Prepare isolated paths (all under RUNNER_TEMP)
+        id: paths
+        run: |
+          set -euo pipefail
+          tmp="${RUNNER_TEMP}/t271"
+          ws="${GITHUB_WORKSPACE}"
+          if [ "${RUNNER_OS}" = "Windows" ]; then
+            tmp="$(cygpath -m "${tmp}")"
+            ws="$(cygpath -m "${ws}")"
+          fi
+          case "${tmp}/" in
+            "${ws}/"*) echo "::error::scratch dir ${tmp} is inside the source checkout ${ws}"; exit 1 ;;
+          esac
+          mkdir -p "${tmp}/logs" "${tmp}/hermes-home" "${tmp}/hermes-runtime" "${tmp}/uv-cache" "${tmp}/ruff-cache"
+          {
+            echo "T271_TMP=${tmp}"
+            echo "HERMES_HOME=${tmp}/hermes-home"
+            echo "HERMES_RUNTIME_DIR=${tmp}/hermes-runtime"
+            echo "UV_CACHE_DIR=${tmp}/uv-cache"
+            echo "RUFF_CACHE_DIR=${tmp}/ruff-cache"
+          } >> "${GITHUB_ENV}"
+          echo "scratch: ${tmp}"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # 8.2.0
+        with:
+          # Same pin as this revision's CI (lint.yml / tests.yml). No cache: nothing may be
+          # written to or restored into the source checkout.
+          version: "0.9.28"
+          enable-cache: false
+
+      - name: Create test venv outside source and install editable '.[all,dev]'
+        id: venv
+        run: |
+          set -euo pipefail
+          venv="${T271_TMP}/venv"
+          uv --version
+          uv venv --python 3.13 "${venv}"
+          if [ "${RUNNER_OS}" = "Windows" ]; then
+            py="${venv}/Scripts/python.exe"
+          else
+            py="${venv}/bin/python"
+          fi
+          [ -x "${py}" ] || { echo "::error::venv interpreter not found at ${py}"; exit 1; }
+          echo "HERMES_PYTHON=${py}" >> "${GITHUB_ENV}"
+          export HERMES_PYTHON="${py}"
+
+          # Bounded retry for transient registry/network failures during the install only.
+          n=0
+          until env -u PYTHONPATH -u PYTHONHOME -u __HERMES_ACTIVATED \
+                uv pip install --python "${py}" -e '.[all,dev]' 2>&1 | tee -a "${T271_TMP}/logs/install.log"; do
+            n=$((n + 1))
+            if [ "${n}" -ge 3 ]; then
+              echo "::error::editable install failed after ${n} attempts"
+              exit 1
+            fi
+            echo "::warning::install attempt ${n} failed; retrying in 10s"
+            sleep 10
+          done
+
+          "${py}" -I -X utf8 -c "import sys; print(sys.version); assert sys.version_info[:2] == (3, 13), sys.version_info"
+          "${py}" -I -X utf8 -c "import pytest; print('pytest', pytest.__version__)"
+          "${py}" -I -X utf8 -m ruff --version
+          # Informational: where the tested modules resolve from (should be the frozen checkout).
+          "${py}" -I -X utf8 -c "import importlib.util as u; s = u.find_spec('tools.computer_use.cua_backend'); print('cua_backend resolves to:', s.origin if s else None)"
+
+      - name: Canonical computer-use tests (scripts/run_tests.sh)
+        id: tests
+        if: ${{ !cancelled() && steps.verify.outcome == 'success' && steps.venv.outcome == 'success' }}
+        run: |
+          set -uo pipefail
+          # Existing computer-use test paths only. The hermes_cli pattern matches nothing at this
+          # base; nullglob drops unmatched patterns instead of passing them through literally.
+          shopt -s nullglob
+          paths=(tests/tools/test_computer_use*.py tests/hermes_cli/test_computer_use*.py)
+          shopt -u nullglob
+          paths+=(tests/computer_use/)
+          echo "test paths:"; printf '  %s\n' "${paths[@]}"
+          found=0
+          for p in "${paths[@]}"; do
+            [ "${p}" = "tests/tools/test_computer_use_cua_036_token_targeting.py" ] && found=1
+          done
+          [ "${found}" = 1 ] || { echo "::error::new regression test file missing from discovery"; exit 1; }
+
+          set +e
+          bash scripts/run_tests.sh "${paths[@]}" -j 4 --file-timeout 120 2>&1 | tee "${T271_TMP}/logs/tests.log"
+          rc=${PIPESTATUS[0]}
+          set -e
+          echo "${rc}" > "${T271_TMP}/logs/tests.rc"
+          echo "scripts/run_tests.sh exit code: ${rc}"
+          exit "${rc}"
+
+      - name: ruff check .
+        id: ruff
+        if: ${{ !cancelled() && steps.verify.outcome == 'success' && steps.venv.outcome == 'success' }}
+        run: |
+          set -uo pipefail
+          set +e
+          "${HERMES_PYTHON}" -I -X utf8 -m ruff check . 2>&1 | tee "${T271_TMP}/logs/ruff.log"
+          rc=${PIPESTATUS[0]}
+          set -e
+          echo "${rc}" > "${T271_TMP}/logs/ruff.rc"
+          echo "ruff exit code: ${rc}"
+          exit "${rc}"
+
+      - name: Windows footguns (--all)
+        id: footguns
+        if: ${{ !cancelled() && steps.verify.outcome == 'success' && steps.venv.outcome == 'success' }}
+        run: |
+          set -uo pipefail
+          set +e
+          "${HERMES_PYTHON}" -I -X utf8 scripts/check-windows-footguns.py --all 2>&1 | tee "${T271_TMP}/logs/footguns.log"
+          rc=${PIPESTATUS[0]}
+          set -e
+          echo "${rc}" > "${T271_TMP}/logs/footguns.rc"
+          echo "check-windows-footguns exit code: ${rc}"
+          exit "${rc}"
+
+      - name: Source checkout must be clean (git status --porcelain)
+        id: clean
+        if: ${{ !cancelled() && steps.verify.outcome == 'success' }}
+        run: |
+          set -euo pipefail
+          head="$(git rev-parse HEAD)"
+          [ "${head}" = "${FROZEN_SHA}" ] || { echo "::error::HEAD moved during the run: ${head}"; exit 1; }
+          status="$(git status --porcelain)"
+          if [ -n "${status}" ]; then
+            echo "::error::checkout is dirty after the gates:"
+            printf '%s\n' "${status}"
+            exit 1
+          fi
+          echo "git status --porcelain is empty; HEAD still ${head}"
+
+      - name: Job summary
+        if: ${{ always() }}
+        env:
+          OUT_VERIFY: ${{ steps.verify.outcome }}
+          OUT_VENV: ${{ steps.venv.outcome }}
+          OUT_TESTS: ${{ steps.tests.outcome }}
+          OUT_RUFF: ${{ steps.ruff.outcome }}
+          OUT_FOOTGUNS: ${{ steps.footguns.outcome }}
+          OUT_CLEAN: ${{ steps.clean.outcome }}
+          MATRIX_OS: ${{ matrix.os }}
+        run: |
+          tested="$(git rev-parse HEAD 2>/dev/null || echo unknown)"
+          logs="${T271_TMP:-}/logs"
+          {
+            echo "## T-271 Cua backport qualification — ${MATRIX_OS}"
+            echo
+            echo "| Item | Value |"
+            echo "|---|---|"
+            echo "| Tested source (git HEAD) | \`${tested}\` |"
+            echo "| Expected frozen SHA | \`${FROZEN_SHA}\` |"
+            echo "| Installed base (parent) | \`${BASE_SHA}\` |"
+            echo "| Controller workflow commit | \`${GITHUB_SHA}\` (${GITHUB_REF}) |"
+            echo "| Runner | ${RUNNER_OS} / ${RUNNER_ARCH} |"
+            echo
+            echo "| Gate | Outcome | Exit code |"
+            echo "|---|---|---|"
+            echo "| Frozen source identity | ${OUT_VERIFY} | - |"
+            echo "| venv + editable install (py3.13, uv 0.9.28) | ${OUT_VENV} | - |"
+            echo "| scripts/run_tests.sh (computer-use) | ${OUT_TESTS} | $(cat "${logs}/tests.rc" 2>/dev/null || echo n/a) |"
+            echo "| ruff check . | ${OUT_RUFF} | $(cat "${logs}/ruff.rc" 2>/dev/null || echo n/a) |"
+            echo "| check-windows-footguns --all | ${OUT_FOOTGUNS} | $(cat "${logs}/footguns.rc" 2>/dev/null || echo n/a) |"
+            echo "| git status --porcelain empty | ${OUT_CLEAN} | - |"
+            echo
+            echo "> Qualification of the frozen commit above only. This is **not** proof of the full upstream CI."
+            if [ -f "${logs}/tests.log" ]; then
+              echo
+              echo "<details><summary>run_tests.sh output (last 40 lines)</summary>"
+              echo
+              echo '```'
+              tail -n 40 "${logs}/tests.log"
+              echo '```'
+              echo "</details>"
+            fi
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Upload gate logs
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: t271-gate-logs-${{ matrix.os }}
+          path: ${{ runner.temp }}/t271/logs
+          if-no-files-found: warn
+          retention-days: 7
