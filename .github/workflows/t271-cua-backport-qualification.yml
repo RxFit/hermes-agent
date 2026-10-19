@@ -26,7 +26,7 @@ concurrency:
 
 env:
   # Frozen repair commit under test and the installed base it must descend from.
-  FROZEN_SHA: d729767ce6cb51852a8ab398d65beb67a0d9e21f
+  FROZEN_SHA: 8d419ffb732c7a7af2a81b4fb4ed8b54ddd8abbe
   BASE_SHA: efbfe0842fb99b93f37546cce406307c0f5eaec0
 
 jobs:
