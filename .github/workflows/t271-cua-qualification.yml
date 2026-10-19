@@ -1,0 +1,130 @@
+name: T-271 CUA qualification (fork, frozen SHA)
+
+# Standalone, secret-free qualification of ONE frozen commit on standard GitHub-hosted runners.
+# It is NOT the upstream CI pipeline (those workflows target Blacksmith capacity this fork may not
+# have): it runs only the computer-use test scope and `scripts/check`, with the repo's own
+# toolchain action. The workflow lives on the CI branch alone; it is not part of the repair PR.
+#
+# The code under test is the hard-coded FROZEN_SHA, never the commit that triggered the run
+# (github.sha is only the workflow's own control commit and is printed for the record).
+
+on:
+  push:
+    branches: [ci/t271-cua-qualification]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: t271-cua-qualification
+  cancel-in-progress: false
+
+env:
+  FROZEN_SHA: 6fd12e2b651e5df140f12bae3e322344b47e23c8
+  BASE_SHA: 0a68b24e4cb129cecae77c731926a29173b151dc
+
+jobs:
+  qualify:
+    name: qualify (${{ matrix.os }})
+    if: github.repository == 'RxFit/hermes-agent'
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix:
+        os: [ubuntu-24.04, windows-2025, macos-15]
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout the frozen repair commit
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
+        with:
+          ref: ${{ env.FROZEN_SHA }}
+          # Full history: the code-health and blob-size guards judge the diff against BASE_SHA.
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Assert the tested commit is the frozen repair SHA
+        env:
+          CONTROL_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          tested="$(git rev-parse HEAD)"
+          echo "workflow/control SHA: $CONTROL_SHA"
+          echo "frozen repair SHA:    $FROZEN_SHA"
+          echo "tested HEAD:          $tested"
+          echo "diff base SHA:        $BASE_SHA"
+          if [ "$tested" != "$FROZEN_SHA" ]; then
+            echo "::error::checked-out HEAD $tested is not the frozen repair SHA $FROZEN_SHA"
+            exit 1
+          fi
+          git cat-file -e "${BASE_SHA}^{commit}"
+          git log -1 --format='tested commit: %H %an %s'
+
+      - name: Set up locked Python and test environment
+        id: pm
+        uses: ./.github/actions/setup-pm
+        with:
+          toolchain: python
+          extras: '[]'
+          test-environment: 'true'
+          archive-inputs: 'false'
+          cache: 'false'
+          cache-python: 'false'
+          cache-node: 'false'
+
+      - name: Show the test interpreter
+        env:
+          HERMES_PYTHON: ${{ steps.pm.outputs.python-path }}
+        run: |
+          set -euo pipefail
+          if [ -z "$HERMES_PYTHON" ] || [ ! -f "$HERMES_PYTHON" ]; then
+            echo "::error::setup-pm returned no test interpreter ($HERMES_PYTHON)"
+            exit 1
+          fi
+          echo "HERMES_PYTHON=$HERMES_PYTHON"
+          "$HERMES_PYTHON" -I -X utf8 -c 'import platform, sys; print(sys.version); print(sys.prefix); print(platform.platform())'
+
+      - name: Run the computer-use test scope
+        id: tests
+        env:
+          HERMES_PYTHON: ${{ steps.pm.outputs.python-path }}
+        run: |
+          set -uo pipefail
+          log="$RUNNER_TEMP/t271-computer-use-tests.log"
+          bash scripts/run_tests.sh tests/tools/test_computer_use*.py tests/hermes_cli/test_computer_use*.py tests/computer_use/ -j 4 --file-timeout 120 2>&1 | tee "$log"
+          rc="${PIPESTATUS[0]}"
+          echo "tested SHA: $(git rev-parse HEAD)"
+          echo "scripts/run_tests.sh exit code: $rc"
+          summary="$(grep -E '^=== Summary' "$log" || true)"
+          echo "result: ${summary:-no summary line found}"
+          {
+            echo "### computer-use tests on ${RUNNER_OS} (exit $rc)"
+            echo '```'
+            echo "tested SHA: $(git rev-parse HEAD)"
+            echo "${summary:-no summary line found}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit "$rc"
+
+      - name: Run scripts/check
+        # Also after a test failure, so one run reports both gates; cancellation still stops it.
+        if: ${{ !cancelled() && steps.pm.outcome == 'success' }}
+        env:
+          HERMES_PYTHON: ${{ steps.pm.outputs.python-path }}
+        run: |
+          set -uo pipefail
+          "$HERMES_PYTHON" -I -X utf8 scripts/check --base "$BASE_SHA"
+          rc=$?
+          echo "tested SHA: $(git rev-parse HEAD)"
+          echo "scripts/check exit code: $rc"
+          exit "$rc"
+
+      - name: Check the checkout is clean
+        # Last step of every job (tests/ci/test_clean_worktree_check.py): a test or CI step that
+        # leaves an untracked or modified file in the checkout is reported here. Runs only when
+        # every earlier step passed: a step that failed midway can leave its own temp files
+        # (a half-extracted download, a worktree its later cleanup never removed).
+        uses: ./.github/actions/check-clean-worktree
