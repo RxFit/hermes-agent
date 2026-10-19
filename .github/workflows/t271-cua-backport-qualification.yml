@@ -25,8 +25,8 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  # Frozen repair commit under test and its required parent (installed base).
-  FROZEN_SHA: b7457d2b1907f3585aeb0b6f1ca935fe9f2a735b
+  # Frozen repair commit under test and the installed base it must descend from.
+  FROZEN_SHA: d729767ce6cb51852a8ab398d65beb67a0d9e21f
   BASE_SHA: efbfe0842fb99b93f37546cce406307c0f5eaec0
 
 jobs:
@@ -58,7 +58,7 @@ jobs:
         with:
           # The frozen commit, regardless of what the controller branch HEAD is.
           ref: ${{ env.FROZEN_SHA }}
-          # Full history so the parent/base relationship can be asserted.
+          # Full history so the installed-base ancestry can be asserted.
           fetch-depth: 0
           persist-credentials: false
 
@@ -78,9 +78,15 @@ jobs:
           [ "${head}" = "${FROZEN_SHA}" ] || fail "checked-out HEAD ${head} != frozen SHA ${FROZEN_SHA}"
           [ "${GITHUB_SHA}" != "${FROZEN_SHA}" ] || echo "note: controller commit equals frozen commit"
 
-          parents="$(git rev-list --parents -n 1 HEAD | cut -d' ' -f2-)"
-          echo "tested source parent(s)      : ${parents}"
-          [ "${parents}" = "${BASE_SHA}" ] || fail "frozen commit parent '${parents}' != base ${BASE_SHA}"
+          # The repair may be several commits (a correction commit follows the first), so assert
+          # that the installed base is an ancestor of the frozen commit, not that it is the parent.
+          git cat-file -e "${BASE_SHA}^{commit}" || fail "installed base ${BASE_SHA} is not present in the checkout"
+          git merge-base --is-ancestor "${BASE_SHA}" "${FROZEN_SHA}" \
+            || fail "installed base ${BASE_SHA} is not an ancestor of frozen commit ${FROZEN_SHA}"
+          echo "tested source parent(s)      : $(git rev-list --parents -n 1 HEAD | cut -d' ' -f2-)"
+          echo "commits on top of base       : $(git rev-list --count "${BASE_SHA}..${FROZEN_SHA}")"
+          git log --oneline "${BASE_SHA}..${FROZEN_SHA}"
+          echo "installed base is an ancestor of the frozen commit"
 
           # The controller workflow must not be part of the tested source.
           if [ -e .github/workflows/t271-cua-backport-qualification.yml ]; then
@@ -254,7 +260,7 @@ jobs:
             echo "|---|---|"
             echo "| Tested source (git HEAD) | \`${tested}\` |"
             echo "| Expected frozen SHA | \`${FROZEN_SHA}\` |"
-            echo "| Installed base (parent) | \`${BASE_SHA}\` |"
+            echo "| Installed base (ancestor) | \`${BASE_SHA}\` |"
             echo "| Controller workflow commit | \`${GITHUB_SHA}\` (${GITHUB_REF}) |"
             echo "| Runner | ${RUNNER_OS} / ${RUNNER_ARCH} |"
             echo
