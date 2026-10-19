@@ -1417,6 +1417,54 @@ class _CuaDriverSession:
             )
             return False
 
+    def input_property_verdict(
+        self, tool: str, property_name: str, sample: Any
+    ) -> Optional[bool]:
+        """Positive schema evidence on whether ``property_name`` is acceptable.
+
+        ``True``/``False`` only when the complete live ``tool`` schema accepts
+        or rejects an object carrying just ``{property_name: sample}``; ``None``
+        when that is unknown.  In JSON Schema an omitted property stays allowed
+        unless ``additionalProperties`` / ``unevaluatedProperties`` / a boolean
+        or composed sub-schema forbids it, and a declared name does not prove a
+        value is accepted, so neither presence nor absence is used as evidence.
+        ``required`` is ignored so unrelated required fields are never mistaken
+        for a prohibition, and a schema that cannot accept an empty object
+        (e.g. ``oneOf`` over ``required``) is unknown.  Root-local ``$ref`` is
+        resolved; remote references are never fetched.  If the validator cannot
+        evaluate the schema, only a structural prohibition counts
+        (``additionalProperties: false`` with the name undeclared, or a
+        ``False`` property schema); everything else is unknown.
+        """
+        schema = getattr(self, "_tool_schemas", {}).get(tool)
+        if not isinstance(schema, dict) or not schema:
+            return None
+        try:
+            from jsonschema.validators import extend, validator_for
+            from referencing import Registry
+
+            base = validator_for(schema)
+            base.check_schema(schema)
+            relaxed = extend(
+                base, {"required": lambda validator, required, instance, schema: iter(())}
+            )
+            validator = relaxed(schema, registry=Registry())
+            if not validator.is_valid({}):
+                return None
+            return validator.is_valid({property_name: sample})
+        except Exception:
+            logger.debug(
+                "cua-driver input schema evaluation failed for %s.%s",
+                tool, property_name, exc_info=True,
+            )
+        properties = schema.get("properties")
+        declared = isinstance(properties, dict) and property_name in properties
+        if declared and properties[property_name] is False:
+            return False
+        if schema.get("additionalProperties") is False and not declared:
+            return False
+        return None
+
     @property
     def capabilities_discovered(self) -> bool:
         """True once ``tools/list`` populated the per-tool map. When False,
@@ -3267,6 +3315,13 @@ class CuaDriverBackend(ComputerUseBackend):
         return self._session.call_tool(name, payload, timeout=timeout)
 
     # ── Internal ───────────────────────────────────────────────────
+    def _input_verdict(self, tool: str, name: str, sample: Any) -> Optional[bool]:
+        """``input_property_verdict`` as a strict tri-state; sessions without it
+        (test fakes, mocks) and non-bool answers mean unknown."""
+        probe = getattr(self._session, "input_property_verdict", None)
+        verdict = probe(tool, name, sample) if callable(probe) else None
+        return verdict if isinstance(verdict, bool) else None
+
     def _maybe_attach_element_token(
         self, tool: str, args: Dict[str, Any]
     ) -> Optional[ActionResult]:
@@ -3285,16 +3340,23 @@ class CuaDriverBackend(ComputerUseBackend):
         drivers that advertise neither never see the property.
 
         cua-driver 0.32+ publishes strict token-only schemas
-        (``additionalProperties: false``) that name ``element_token`` but drop
-        ``element_index``: the token is sent alone, and an index with no token
-        from the latest capture (stale, superseded or never captured) is
+        (``additionalProperties: false``) that accept ``element_token`` and
+        forbid ``element_index``: the token is sent alone, and an index with no
+        token from the latest capture (stale, superseded or never captured) is
         refused here with ``stale_element`` so it can never reach the driver,
         be re-resolved to another element, or degrade into untargeted input.
+        A schema is token-only only on POSITIVE evidence that the index is
+        forbidden (``input_property_verdict``): declaring ``element_token``
+        without listing ``element_index`` is not enough, because an omitted
+        property stays allowed unless the schema forbids it. Permissive or
+        unknown schemas keep the legacy behaviour (index kept beside the token,
+        a tokenless index sent as-is). A token the live schema positively
+        rejects is not attached on the schema's say-so; the older
+        ``capabilities[]`` claim still attaches it, exactly as before.
         Index ``0`` (the AXWindow root) is a valid, falsy index.
 
         Returns an ``ActionResult`` refusal to short-circuit the call, else
-        ``None``. Fakes that answer with non-bool truthy values (mocks) do not
-        count as schema support.
+        ``None``. Fakes that answer with non-bool values (mocks) are unknown.
         """
         if "element_index" not in args:
             return None
@@ -3302,11 +3364,15 @@ class CuaDriverBackend(ComputerUseBackend):
         # bool is an int subclass but never a valid element index.
         index = idx if type(idx) is int else None
         token = self._snapshot_tokens.get(index) if index is not None else None
-        accepts_token = (
-            self._session.supports_input_property(tool, "element_token") is True
-        )
+        token_verdict = self._input_verdict(tool, "element_token", "token")
+        if token_verdict is None:  # unknown: fall back to the declared name
+            accepts_token = (
+                self._session.supports_input_property(tool, "element_token") is True
+            )
+        else:
+            accepts_token = token_verdict
         token_only = accepts_token and (
-            self._session.supports_input_property(tool, "element_index") is not True
+            self._input_verdict(tool, "element_index", 0) is False
         )
         if token and (
             accepts_token

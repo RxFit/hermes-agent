@@ -332,3 +332,147 @@ def test_reconnect_clears_cached_schemas_with_the_capabilities():
     session._start_lifecycle_locked = lambda: None
     session._restart_session_locked()
     assert session._capabilities == {} and session._tool_schemas == {}
+
+
+# ---------------------------------------------------------------------------
+# Token-only classification needs POSITIVE evidence that element_index is forbidden.
+# Omitting a property from ``properties`` does not forbid it under JSON Schema.
+# ---------------------------------------------------------------------------
+
+_TOKEN_PROPS = {"pid": {"type": "integer"}, "window_id": {"type": "integer"}, "element_token": {"type": "string"}}
+
+
+def _click_schema(**keywords: Any) -> Dict[str, Any]:
+    return {"type": "object", "properties": dict(_TOKEN_PROPS), **keywords}
+
+
+# Schemas that positively forbid element_index while accepting element_token.
+_FORBIDS_INDEX = {
+    "strict": _click_schema(additionalProperties=False),
+    "strict-with-unrelated-required": _click_schema(additionalProperties=False, required=["pid", "window_id"]),
+    "boolean-false-index": _click_schema(properties={**_TOKEN_PROPS, "element_index": False}),
+    "local-ref-false-index": _click_schema(properties={**_TOKEN_PROPS, "element_index": {"$ref": "#/$defs/never"}},
+                                           **{"$defs": {"never": False}}),
+    "composed-via-local-ref": {"allOf": [{"$ref": "#/$defs/target"}],
+                               "$defs": {"target": _click_schema(additionalProperties=False)}},
+    "unevaluated-properties-false": {"type": "object", "allOf": [{"properties": dict(_TOKEN_PROPS)}],
+                                     "unevaluatedProperties": False},
+}
+
+# Schemas that declare element_token but still PERMIT element_index (or whose support is unknown).
+_PERMITS_INDEX = {
+    "additionalProperties-omitted": _click_schema(),
+    "additionalProperties-true": _click_schema(additionalProperties=True),
+    "additionalProperties-empty-schema": _click_schema(additionalProperties={}),
+    "unrelated-required-does-not-forbid": _click_schema(required=["pid", "element_token"]),
+    "composed-permissive": {"allOf": [_click_schema(), {"properties": {"button": {"type": "string"}}}]},
+    "unknown-oneOf-required": _click_schema(oneOf=[{"required": ["pid"]}, {"required": ["window_id"]}]),
+    "remote-ref-property-unresolvable": _click_schema(
+        properties={**_TOKEN_PROPS, "button": {"$ref": "https://invalid.example/button.json"}}),
+    "index-declared": _click_schema(properties={**_TOKEN_PROPS, "element_index": {"type": "integer"}},
+                                    additionalProperties=False),
+}
+
+
+@pytest.mark.parametrize("tool", ["click", "set_value"])
+@pytest.mark.parametrize("name", list(_FORBIDS_INDEX))
+@pytest.mark.parametrize("index", [0, 1, _ELEMENT_COUNT - 1], ids=["root-0", "first", "last"])
+def test_positive_prohibition_of_the_index_makes_the_schema_token_only(name, tool, index):
+    backend = _backend({tool: _FORBIDS_INDEX[name]}, tokens={i: f"s1:{i}" for i in range(_ELEMENT_COUNT)})
+    assert _act(backend, tool, index).ok is True
+    args = backend._session.call_tool.call_args.args[1]
+    assert args["element_token"] == f"s1:{index}" and "element_index" not in args
+
+
+@pytest.mark.parametrize("name", list(_FORBIDS_INDEX))
+def test_positive_prohibition_of_the_index_still_refuses_a_tokenless_index(name):
+    backend = _backend({"click": _FORBIDS_INDEX[name]}, tokens={1: "s1:1"})
+    res = backend.click(element=0)
+    assert res.ok is False and res.code == "stale_element"
+    backend._session.call_tool.assert_not_called()
+
+
+@pytest.mark.parametrize("tool", ["click", "set_value"])
+@pytest.mark.parametrize("name", list(_PERMITS_INDEX))
+@pytest.mark.parametrize("index", [0, 1, _ELEMENT_COUNT - 1], ids=["root-0", "first", "last"])
+def test_permissive_or_unknown_schema_keeps_the_index_beside_the_token(name, tool, index):
+    backend = _backend({tool: _PERMITS_INDEX[name]}, tokens={i: f"s1:{i}" for i in range(_ELEMENT_COUNT)})
+    assert _act(backend, tool, index).ok is True
+    args = backend._session.call_tool.call_args.args[1]
+    assert args["element_index"] == index and args["element_token"] == f"s1:{index}"
+
+
+@pytest.mark.parametrize("name", list(_PERMITS_INDEX))
+def test_permissive_or_unknown_schema_never_refuses_a_tokenless_index(name):
+    backend = _backend({"click": _PERMITS_INDEX[name]}, tokens={})
+    assert backend.click(element=0).ok is True
+    args = backend._session.call_tool.call_args.args[1]
+    assert args["element_index"] == 0 and "element_token" not in args
+
+
+@pytest.mark.parametrize("schema", [
+    _click_schema(properties={**_TOKEN_PROPS, "element_token": False}),
+    _click_schema(properties={**_TOKEN_PROPS, "element_token": False, "element_index": {"type": "integer"}},
+                  additionalProperties=False),
+], ids=["permissive", "strict-with-index"])
+def test_a_token_the_schema_rejects_is_not_attached_from_the_schema(schema):
+    """Declaring ``element_token`` is not proof it is accepted (boolean ``false``). The separate legacy
+    ``capabilities[]`` path is deliberately unchanged (see the capability-advertised test above)."""
+    backend = _backend({"click": schema}, tokens={5: "s1:5"})
+    assert backend.click(element=5).ok is True
+    args = backend._session.call_tool.call_args.args[1]
+    assert args["element_index"] == 5 and "element_token" not in args
+
+
+@pytest.mark.parametrize("name", list(_FORBIDS_INDEX))
+def test_without_a_validator_only_a_structural_prohibition_counts(monkeypatch, name):
+    """If jsonschema cannot evaluate the schema, `additionalProperties: false` / `element_index: false`
+    still classify as token-only; anything needing real evaluation stays legacy, never token-only."""
+    def unavailable(*args, **kwargs):
+        raise ImportError("jsonschema unavailable")
+    monkeypatch.setattr("jsonschema.validators.validator_for", unavailable)
+    structural = name in {"strict", "strict-with-unrelated-required", "boolean-false-index"}
+    backend = _backend({"click": _FORBIDS_INDEX[name]}, tokens={5: "s1:5"})
+    assert backend.click(element=5).ok is True
+    args = backend._session.call_tool.call_args.args[1]
+    if structural:
+        assert args["element_token"] == "s1:5" and "element_index" not in args
+    else:
+        assert args["element_index"] == 5  # needs real evaluation: unknown, so legacy behaviour
+
+
+@pytest.mark.parametrize("name", list(_PERMITS_INDEX))
+def test_without_a_validator_permissive_schemas_stay_legacy(monkeypatch, name):
+    monkeypatch.setattr("jsonschema.validators.validator_for", lambda *a, **k: (_ for _ in ()).throw(ImportError()))
+    backend = _backend({"click": _PERMITS_INDEX[name]}, tokens={5: "s1:5"})
+    assert backend.click(element=5).ok is True
+    args = backend._session.call_tool.call_args.args[1]
+    assert args["element_index"] == 5
+
+
+def test_classification_never_fetches_remote_schema_references(monkeypatch):
+    remote_reads: List[Any] = []
+    monkeypatch.setattr("urllib.request.urlopen", lambda *a, **k: remote_reads.append(a))
+    schema = _click_schema(properties={**_TOKEN_PROPS, "element_index": {"$ref": "https://invalid.example/i.json"}})
+    backend = _backend({"click": schema}, tokens={5: "s1:5"})
+    assert backend.click(element=5).ok is True  # unresolvable: unknown, legacy behaviour
+    args = backend._session.call_tool.call_args.args[1]
+    assert args["element_index"] == 5
+    assert remote_reads == []
+
+
+def test_tree_format_resolves_a_root_local_defs_ref_and_still_rejects_remote_refs(monkeypatch):
+    """Review finding 1 did not reproduce: a root-local $ref is resolved (documents correct behaviour),
+    while a remote $ref keeps failing closed without any network read."""
+    remote_reads: List[Any] = []
+    monkeypatch.setattr("urllib.request.urlopen", lambda *a, **k: remote_reads.append(a))
+    local = {"properties": {"tree_format": {"$ref": "#/$defs/treeFormat"}},
+             "$defs": {"treeFormat": {"enum": ["markdown", "elements", "both"]}}}
+    backend = _capture_backend(local)
+    assert backend._session.supports_input_value("get_window_state", "tree_format", "elements") is True
+    assert backend._session.supports_input_value("get_window_state", "tree_format", "bogus") is False
+    backend._active_pid, backend._active_window_id = 101, 202
+    assert backend._gws_args(structured=True)["tree_format"] == "elements"
+    remote = _capture_backend({"properties": {"tree_format": {"$ref": "https://invalid.example/f.json"}}})
+    assert remote._session.supports_input_value("get_window_state", "tree_format", "elements") is False
+    assert remote_reads == []
