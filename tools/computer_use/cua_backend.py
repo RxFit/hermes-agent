@@ -1417,46 +1417,73 @@ class _CuaDriverSession:
             )
             return False
 
-    def input_property_verdict(
-        self, tool: str, property_name: str, sample: Any
-    ) -> Optional[bool]:
-        """Positive schema evidence on whether ``sample`` is acceptable.
+    def input_value_rejected(
+        self, tool: str, payload: Dict[str, Any], property_name: str
+    ) -> bool:
+        """Whether the live schema rejects ``property_name`` in this ACTUAL payload.
 
-        ``sample`` must be the ACTUAL value about to be sent (the real element
-        index or snapshot token), never a placeholder: ``pattern`` /
-        ``minLength`` / ``enum`` / ``minimum`` decide on the real value.
-        ``True``/``False`` only when the complete live ``tool`` schema accepts
-        or rejects an object carrying just ``{property_name: sample}``; ``None``
-        when that is unknown.  In JSON Schema an omitted property stays allowed
-        unless ``additionalProperties`` / ``unevaluatedProperties`` / a boolean
-        or composed sub-schema forbids it, and a declared name does not prove a
-        value is accepted, so neither presence nor absence is used as evidence.
-        ``required`` is ignored so unrelated required fields are never mistaken
-        for a prohibition, and a schema that cannot accept an empty object
-        (e.g. ``oneOf`` over ``required``) is unknown.  Root-local ``$ref`` is
-        resolved; remote references are never fetched.  If the validator cannot
-        evaluate the schema, only a structural prohibition counts, and only
-        when the property list is certainly exhaustive: a ``False`` property
-        schema, or ``additionalProperties: false`` with the name undeclared and
-        no ``patternProperties`` / composition keyword at the root.  A missing
-        validator is never permission to infer more from a property list.
+        ``payload`` must be the complete outbound action arguments (real pid,
+        window, session, element index, snapshot token ...).  An isolated
+        one-property probe is unsound: it discards cross-field context
+        (``dependentRequired``, ``if``/``then``, ``dependentSchemas``), so a
+        valid action looks rejected, and a conditional can look accepted.
+
+        ``True`` only when the validator, run over the whole payload, reports
+        an error that is attributable to ``property_name`` itself:
+
+        * a property-level error at ``/<property_name>`` (``type``, ``minimum``,
+          ``pattern``, ``minLength``, ``enum``, a ``false`` property schema, an
+          ``additionalProperties`` sub-schema ...), or
+        * a root ``additionalProperties`` / ``unevaluatedProperties`` error that
+          names the property as unexpected.
+
+        Everything else is "not shown to be rejected" (``False``): errors on
+        other fields, ``required`` / ``dependentRequired`` / ``minProperties``
+        failures, and errors that only surface as an ``anyOf`` / ``oneOf`` /
+        ``not`` summary cannot be pinned on this property, so established
+        legacy behaviour is retained.  An overall invalid payload is therefore
+        not proof that the index is forbidden.  Root-local ``$ref`` is
+        resolved; remote references are never fetched.  If the validator is
+        unavailable or cannot evaluate the schema, only a structural
+        prohibition counts, and only when the property list is certainly
+        exhaustive: a ``false`` property schema, or ``additionalProperties:
+        false`` with the name undeclared and no ``patternProperties`` /
+        composition keyword at the root.
         """
         schema = getattr(self, "_tool_schemas", {}).get(tool)
         if not isinstance(schema, dict) or not schema:
-            return None
+            return False
         try:
-            from jsonschema.validators import extend, validator_for
+            from jsonschema.validators import validator_for
             from referencing import Registry
 
-            base = validator_for(schema)
-            base.check_schema(schema)
-            relaxed = extend(
-                base, {"required": lambda validator, required, instance, schema: iter(())}
-            )
-            validator = relaxed(schema, registry=Registry())
-            if not validator.is_valid({}):
-                return None
-            return validator.is_valid({property_name: sample})
+            cls = validator_for(schema)
+            cls.check_schema(schema)
+            validator = cls(schema, registry=Registry())
+            errors = list(validator.iter_errors(payload))
+            quoted = repr(property_name)
+            for error in errors:
+                path = tuple(error.absolute_path)
+                if path == (property_name,):
+                    return True
+                if (
+                    not path
+                    and error.validator in ("additionalProperties", "unevaluatedProperties")
+                    and quoted in error.message
+                ):
+                    return True
+            # jsonschema yields a ``false`` property schema's error WITHOUT a path
+            # (and with no validator keyword), so it cannot be located by path.
+            # Attribute it only if dropping this property removes such an error.
+            pathless = [e for e in errors if e.validator is None and not tuple(e.absolute_path)]
+            if pathless:
+                rest = {k: v for k, v in payload.items() if k != property_name}
+                remaining = [
+                    e for e in validator.iter_errors(rest)
+                    if e.validator is None and not tuple(e.absolute_path)
+                ]
+                return len(remaining) < len(pathless)
+            return False
         except Exception:
             logger.debug(
                 "cua-driver input schema evaluation failed for %s.%s",
@@ -1465,14 +1492,12 @@ class _CuaDriverSession:
         properties = schema.get("properties")
         declared = isinstance(properties, dict) and property_name in properties
         if declared and properties[property_name] is False:
-            return False
-        if (
+            return True
+        return (
             schema.get("additionalProperties") is False
             and not declared
             and not any(key in schema for key in self._NON_EXHAUSTIVE_KEYWORDS)
-        ):
-            return False
-        return None
+        )
 
     # Root keywords that make a ``properties`` list non-exhaustive or conditional,
     # so the structural fallback must not read ``additionalProperties: false`` as
@@ -3369,12 +3394,11 @@ class CuaDriverBackend(ComputerUseBackend):
         return self._session.call_tool(name, payload, timeout=timeout)
 
     # ── Internal ───────────────────────────────────────────────────
-    def _input_verdict(self, tool: str, name: str, sample: Any) -> Optional[bool]:
-        """``input_property_verdict`` as a strict tri-state; sessions without it
-        (test fakes, mocks) and non-bool answers mean unknown."""
-        probe = getattr(self._session, "input_property_verdict", None)
-        verdict = probe(tool, name, sample) if callable(probe) else None
-        return verdict if isinstance(verdict, bool) else None
+    def _input_rejected(self, tool: str, payload: Dict[str, Any], name: str) -> bool:
+        """``input_value_rejected`` as a strict bool; sessions without it (test
+        fakes) and non-bool answers (mocks) mean "not shown to be rejected"."""
+        probe = getattr(self._session, "input_value_rejected", None)
+        return probe(tool, payload, name) is True if callable(probe) else False
 
     def _declares_input(self, tool: str, name: str) -> bool:
         """``declares_input_property`` with a ``supports_input_property`` fallback
@@ -3386,7 +3410,7 @@ class CuaDriverBackend(ComputerUseBackend):
         return self._session.supports_input_property(tool, name) is True
 
     def _maybe_attach_element_token(
-        self, tool: str, args: Dict[str, Any]
+        self, tool: str, args: Dict[str, Any], *, inject_session: bool = True
     ) -> Optional[ActionResult]:
         """Surface 6: when the wrapper is about to call a token-capable
         tool with `element_index`, look up the matching `element_token`
@@ -3408,23 +3432,26 @@ class CuaDriverBackend(ComputerUseBackend):
         token from the latest capture (stale, superseded or never captured) is
         refused here with ``stale_element`` so it can never reach the driver,
         be re-resolved to another element, or degrade into untargeted input.
-        The index is dropped only on POSITIVE evidence that the schema rejects
-        the ACTUAL index payload (``input_property_verdict`` with the real
-        value, so ``minimum`` / ``enum`` count): declaring ``element_token``
-        without listing ``element_index`` is not enough, because an omitted
-        property stays allowed unless the schema forbids it. Permissive or
-        unknown schemas keep the legacy behaviour (index kept beside the token,
-        a tokenless index sent as-is). The token is likewise evaluated with its
-        ACTUAL value and is attached only when the schema declares
+        Negotiation happens in the REAL outbound payload (all other action
+        fields, the session id and the actual index/token values), never in an
+        isolated one-property probe, and the index is dropped only on POSITIVE,
+        attributable evidence that the schema rejects it
+        (``input_value_rejected``): declaring ``element_token`` without listing
+        ``element_index`` is not enough, because an omitted property stays
+        allowed unless the schema forbids it, and an invalid payload because of
+        another field, or a constraint that cannot be pinned on the index, is
+        "not shown to be rejected". Permissive or unknown schemas keep the
+        legacy behaviour (index kept beside the token, a tokenless index sent
+        as-is). The token is attached only when the schema declares
         ``element_token`` (a schema that merely tolerates extra properties is
         not support, so unadvertised tokens are not sent) or the older
         ``capabilities[]`` claim advertises it, exactly as before; a declared
-        token the schema rejects (``pattern`` mismatch ...) is not sent, and
-        with a rejected index too the action is refused.
+        token the schema rejects for its actual value (``pattern`` mismatch ...)
+        is not sent, and with a rejected index too the action is refused.
         Index ``0`` (the AXWindow root) is a valid, falsy index.
 
         Returns an ``ActionResult`` refusal to short-circuit the call, else
-        ``None``. Fakes that answer with non-bool values (mocks) are unknown.
+        ``None``.
         """
         if "element_index" not in args:
             return None
@@ -3435,22 +3462,30 @@ class CuaDriverBackend(ComputerUseBackend):
 
         # 1. Is the ACTUAL snapshot token attachable? Only a driver that declares
         #    ``element_token`` (or advertises the legacy capability) ever sees one;
-        #    a schema that merely tolerates extra properties is not support.  When
-        #    the schema evaluates the real token, a rejection (pattern / minLength /
-        #    enum ...) means it is not sent; unknown falls back to the declaration.
+        #    a schema that merely tolerates extra properties is not support.  A
+        #    rejection of the real token that is attributable to it (pattern /
+        #    minLength / enum ...) means it is not sent.  Evaluated inside the real
+        #    outbound payload (``outbound``), as the driver will see it.
+        outbound = dict(args)
+        if inject_session:
+            outbound.setdefault("session", self._session_id)
         attach = False
         if token:
-            token_verdict = self._input_verdict(tool, "element_token", token)
-            if token_verdict is not False and self._declares_input(tool, "element_token"):
+            if not self._input_rejected(
+                tool, {**outbound, "element_token": token}, "element_token"
+            ) and self._declares_input(tool, "element_token"):
                 attach = True
             elif self._session.supports_capability(
                 "accessibility.element_tokens", tool=tool
             ):
                 attach = True
+        if attach:
+            outbound["element_token"] = token
 
-        # 2. Does the schema reject the ACTUAL index payload?  (Forbidden outright,
-        #    or its value violates e.g. ``minimum``.)  ``None`` = unknown = legacy.
-        index_rejected = self._input_verdict(tool, "element_index", idx) is False
+        # 2. Does the schema reject the ACTUAL index inside that same payload?
+        #    (Forbidden outright, or its value violates e.g. ``minimum``, or a
+        #    conditional on other fields rejects it.)  Not attributable = legacy.
+        index_rejected = self._input_rejected(tool, outbound, "element_index")
 
         if attach:
             args["element_token"] = token
@@ -3479,7 +3514,9 @@ class CuaDriverBackend(ComputerUseBackend):
         # Attach the snapshot's element_token whenever the call carries
         # an element_index and the target tool's schema/capabilities accept
         # it; a strict token-only schema without a token refuses locally.
-        refusal = self._maybe_attach_element_token(name, args)
+        refusal = self._maybe_attach_element_token(
+            name, args, inject_session=inject_session
+        )
         if refusal is not None:
             return refusal
         # Carry this run's session id so the cua-driver agent cursor

@@ -614,3 +614,121 @@ def test_without_a_validator_a_simple_strict_schema_is_still_token_only(monkeypa
     assert res.ok is True and sent["element_token"] == "tok_synthetic" and "element_index" not in sent
     res, sent = _send(_PATTERNED, 1, {})
     assert res.ok is False and res.code == "stale_element" and sent is None
+
+
+# ---------------------------------------------------------------------------
+# Negotiate inside the REAL outbound action payload, never an isolated one-property probe.
+# A verdict may only reject the index/token when the rejection is attributable to that
+# property itself; another field's error, or a constraint that needs other fields, is unknown.
+# ---------------------------------------------------------------------------
+
+_CTX_PROPS = {"pid": {"type": "integer"}, "window_id": {"type": "integer"},
+              "button": {"enum": ["left", "right", "middle"]}, "session": {"type": "string"},
+              "element_index": {"type": "integer"}, "element_token": {"type": "string"}}
+
+
+def _ctx_schema(**keywords: Any) -> Dict[str, Any]:
+    return {"type": "object", "properties": dict(_CTX_PROPS), "additionalProperties": False, **keywords}
+
+
+def test_manager_reproduction_dependent_required_keeps_the_valid_index():
+    """Manager reproduction (8d419ffb7): `dependentRequired: element_index -> pid`; the real args
+    {element_index: 1, pid: 123} are valid, an isolated {element_index: 1} probe is not."""
+    schema = {"type": "object", "properties": {"element_index": {"type": "integer"}, "pid": {"type": "integer"}},
+              "dependentRequired": {"element_index": ["pid"]}, "additionalProperties": False}
+    backend = _backend({"click": schema}, tokens={})
+    res = backend._action("click", {"element_index": 1, "pid": 123})
+    assert res.ok is True, res.message
+    sent = backend._session.call_tool.call_args.args[1]
+    assert sent["element_index"] == 1 and sent["pid"] == 123 and "element_token" not in sent
+
+
+@pytest.mark.parametrize("tool", ["click", "set_value", "scroll", "double_click"])
+def test_dependent_required_on_a_fully_declared_action_keeps_index_and_token(tool):
+    schema = _ctx_schema(dependentRequired={"element_index": ["pid"], "element_token": ["pid"]})
+    res, sent = _send(schema, 1, {1: "tok_synthetic"}, tool=tool)
+    assert res.ok is True
+    assert sent["element_index"] == 1 and sent["element_token"] == "tok_synthetic"
+
+
+def test_dependent_required_without_a_token_sends_the_legacy_index():
+    res, sent = _send(_ctx_schema(dependentRequired={"element_index": ["pid"]}), 0, {})
+    assert res.ok is True and sent["element_index"] == 0 and "element_token" not in sent
+
+
+_IF_PID = {"if": {"properties": {"pid": {"const": 111}}, "required": ["pid"]},
+           "then": {"properties": {"element_index": {"minimum": 0}}},
+           "else": {"properties": {"element_index": False}}}
+
+
+def test_a_conditional_that_depends_on_another_field_is_evaluated_in_the_real_payload():
+    schema = _ctx_schema(**_IF_PID)
+    res, sent = _send(schema, 4, {4: "tok_x"})  # real pid is 111 -> `then` applies -> index valid
+    assert res.ok is True and sent["element_index"] == 4 and sent["element_token"] == "tok_x"
+    res, sent = _send(schema, 4, {})
+    assert res.ok is True and sent["element_index"] == 4 and "element_token" not in sent
+
+
+def test_a_context_specific_rejection_attributable_to_the_index_still_counts():
+    """pid 999 selects the `else` branch where `element_index` is a false schema: the real payload's
+    index IS rejected, so it is dropped when a token exists and the action is refused otherwise."""
+    backend = _backend({"click": _ctx_schema(**_IF_PID)}, tokens={4: "tok_x"})
+    backend._active_pid = 999
+    assert backend.click(element=4).ok is True
+    sent = backend._session.call_tool.call_args.args[1]
+    assert sent["element_token"] == "tok_x" and "element_index" not in sent
+    backend = _backend({"click": _ctx_schema(**_IF_PID)}, tokens={})
+    backend._active_pid = 999
+    res = backend.click(element=4)
+    assert res.ok is False and res.code == "stale_element"
+    backend._session.call_tool.assert_not_called()
+
+
+def test_a_composed_constraint_that_cannot_be_attributed_is_unknown_not_a_refusal():
+    schema = _ctx_schema(anyOf=[{"properties": {"element_index": {"minimum": 100}}},
+                                {"properties": {"element_index": {"maximum": -1}}}])
+    res, sent = _send(schema, 5, {})
+    assert res.ok is True and sent["element_index"] == 5  # rejection not attributable -> legacy
+    res, sent = _send(schema, 5, {5: "tok_x"})
+    assert res.ok is True and sent["element_index"] == 5 and sent["element_token"] == "tok_x"
+
+
+def test_dependent_required_on_the_token_does_not_hide_a_valid_token():
+    schema = {"type": "object", "properties": {**_CTX_PROPS, "element_index": False},
+              "dependentRequired": {"element_token": ["pid"]}, "additionalProperties": False}
+    res, sent = _send(schema, 2, {2: "tok_synthetic"})
+    assert res.ok is True and sent["element_token"] == "tok_synthetic" and "element_index" not in sent
+
+
+@pytest.mark.parametrize("tool", ["click", "set_value"])
+def test_an_unrelated_invalid_field_is_not_proof_that_a_declared_index_is_forbidden(tool):
+    backend = _backend({tool: _ctx_schema()}, tokens={})
+    backend._active_pid = "not-an-integer"  # another field's error only
+    res = _act(backend, tool, 3)
+    assert res.ok is True
+    assert backend._session.call_tool.call_args.args[1]["element_index"] == 3
+
+
+def test_a_false_schema_on_an_unrelated_field_is_not_attributed_to_the_index():
+    """A `false` property schema yields a path-less error; it only counts against the index when
+    dropping the index removes it. Here `pid` is the rejected field, the index is fine."""
+    schema = _ctx_schema(properties={**_CTX_PROPS, "pid": False})
+    res, sent = _send(schema, 3, {})
+    assert res.ok is True and sent["element_index"] == 3
+    res, sent = _send(schema, 3, {3: "tok_x"})
+    assert res.ok is True and sent["element_index"] == 3 and sent["element_token"] == "tok_x"
+
+
+def test_an_unrelated_invalid_field_does_not_weaken_strict_token_only_safety():
+    strict = {"type": "object", "properties": {k: v for k, v in _CTX_PROPS.items() if k != "element_index"},
+              "additionalProperties": False}
+    backend = _backend({"click": strict}, tokens={3: "tok_x"})
+    backend._active_pid = "not-an-integer"
+    assert backend.click(element=3).ok is True
+    sent = backend._session.call_tool.call_args.args[1]
+    assert sent["element_token"] == "tok_x" and "element_index" not in sent
+    backend = _backend({"click": strict}, tokens={})
+    backend._active_pid = "not-an-integer"
+    res = backend.click(element=3)
+    assert res.ok is False and res.code == "stale_element"
+    backend._session.call_tool.assert_not_called()
