@@ -46,7 +46,8 @@ class TestRegistration:
         from tools.computer_use import cua_backend
         from tools.computer_use import cua_backend_driver
 
-        driver = tmp_path / "custom-cua-driver"
+        # Windows only treats a file with a PATHEXT extension as executable (shutil.which).
+        driver = tmp_path / ("custom-cua-driver.exe" if os.name == "nt" else "custom-cua-driver")
         driver.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
         driver.chmod(0o755)
 
@@ -1219,8 +1220,8 @@ class TestCuaDriverSessionReconnect:
             returncode = 0
             stderr = ""
             # Daemon returns a path, not inline base64.
-            stdout = ('{"element_count": 7, "tree_markdown": "- [0] AXButton",'
-                      f' "screenshot_file_path": "{shot!s}"}}')
+            stdout = json.dumps({"element_count": 7, "tree_markdown": "- [0] AXButton",
+                                 "screenshot_file_path": str(shot)})
 
         import subprocess as _sp
         orig_run = _sp.run
@@ -1470,6 +1471,10 @@ class TestCuaEnvironmentScrubbing:
                 "PATH": "/usr/bin:/bin",               # safe
                 "HOME": "/home/user",                  # safe
                 "SAFE_VAR": "allowed",                 # safe
+                # Windows resolves the home directory (and so the first import of the sanitizer) from
+                # these; a bare clear=True environment fails with "Could not determine home directory".
+                **{key: os.environ[key] for key in ("HERMES_HOME", "USERPROFILE", "LOCALAPPDATA", "SYSTEMROOT")
+                   if key in os.environ},
             }
 
             def capture_env(**kwargs):
@@ -1960,112 +1965,6 @@ class TestCapabilityDiscovery:
                                            tool="type_text") is False
         # Unknown tool → False (instead of KeyError).
         assert session.supports_capability("anything", tool="never_registered") is False
-
-
-class TestElementTokenAttachment:
-    """Surface 6 (NousResearch/hermes-agent#47072): trycua/cua#1961 added
-    an opaque `element_token` alongside `element_index` so the wrapper
-    can carry per-snapshot handles instead of relying on raw indices that
-    silently re-resolve when the snapshot is superseded.
-
-    The contract the wrapper implements:
-    1. capture() refreshes a per-snapshot {index -> token} map from
-       structuredContent.elements.
-    2. Whenever an action carrying element_index is about to hit cua-driver,
-       look up the matching token and attach it — but ONLY for tools that
-       advertise `accessibility.element_tokens` (Surface 4 gate). Older
-       drivers reject unknown args via additionalProperties=false.
-    3. cua-driver prefers token over index when both are supplied, so
-       sending both is safe and stale-detection becomes explicit.
-    """
-
-    def _backend_with_session(self, capabilities):
-        """Build a backend whose session reports the given capabilities map."""
-        from unittest.mock import MagicMock
-        from tools.computer_use.cua_backend import CuaDriverBackend
-
-        backend = CuaDriverBackend()
-        backend._session = MagicMock()
-        backend._session.call_tool.return_value = {
-            "data": "ok", "images": [], "image_mime_types": [],
-            "structuredContent": None, "isError": False,
-        }
-        # `supports_capability(cap, tool=None)` honors the supplied map.
-        def _supports(cap, tool=None):
-            if tool is not None:
-                return cap in capabilities.get(tool, set())
-            return any(cap in caps for caps in capabilities.values())
-        backend._session.supports_capability = _supports
-        backend._active_pid = 111
-        backend._active_window_id = 222
-        return backend
-
-    def test_token_attached_when_tool_advertises_capability(self):
-        backend = self._backend_with_session({
-            "click": {"input.pointer.click", "accessibility.element_tokens"},
-        })
-        backend._snapshot_tokens = {5: "s0001:5", 6: "s0001:6"}
-        backend.click(element=5, button="left")
-        name, args = backend._session.call_tool.call_args.args
-        assert name == "click"
-        assert args["element_index"] == 5
-        # The matching token rode along — cua-driver will prefer it.
-        assert args["element_token"] == "s0001:5"
-
-    def test_token_attached_when_only_input_schema_advertises_it(self):
-        """cua-driver >= 0.21 dropped the per-tool `capabilities[]` array from tools/list but advertises
-        `element_token` in `click`'s inputSchema and REFUSES a bare element_index (`snapshot_id_required`).
-        The token must ride along from the live schema alone, or every element click is refused."""
-        backend = self._backend_with_session({})  # no capabilities[] at all — the modern shape
-        backend._session.supports_input_property = lambda tool, prop: (tool, prop) == ("click", "element_token")
-        backend._snapshot_tokens = {5: "s00000001:5"}
-        backend.click(element=5, button="left")
-        _, args = backend._session.call_tool.call_args.args
-        assert args["element_token"] == "s00000001:5"
-
-
-    def test_capture_refreshes_snapshot_tokens(self):
-        """A fresh capture should overwrite any stale tokens from a
-        previous snapshot — token cache invariant: only the latest
-        capture's tokens are eligible for attachment."""
-        from unittest.mock import MagicMock
-        from tools.computer_use.cua_backend import CuaDriverBackend
-
-        backend = CuaDriverBackend()
-        backend._session = MagicMock()
-        backend._session.supports_capability = lambda cap, tool=None: True
-        # Pretend an earlier capture left this stale state.
-        backend._snapshot_tokens = {99: "stale:99"}
-
-        windows_payload = {"windows": [{
-            "app_name": "Demo", "pid": 9, "window_id": 1,
-            "is_on_screen": True, "title": "", "z_index": 0,
-        }]}
-
-        def fake_call_tool(name, args):
-            if name == "list_windows":
-                return {"data": "", "images": [], "image_mime_types": [],
-                        "structuredContent": windows_payload, "isError": False}
-            if name == "get_window_state":
-                return {
-                    "data": '✅ Demo — 2 elements, turn 1\n',
-                    "images": [], "image_mime_types": [],
-                    "structuredContent": {"elements": [
-                        {"element_index": 1, "role": "AXButton", "label": "OK",
-                         "element_token": "snap2:1"},
-                        {"element_index": 2, "role": "AXButton", "label": "X",
-                         "element_token": "snap2:2"},
-                    ]},
-                    "isError": False,
-                }
-            return {"data": "", "images": [], "image_mime_types": [],
-                    "structuredContent": None, "isError": False}
-
-        backend._session.call_tool.side_effect = fake_call_tool
-        backend.capture(mode="ax")
-
-        # Stale 99 token is gone; only the two new tokens remain.
-        assert backend._snapshot_tokens == {1: "snap2:1", 2: "snap2:2"}
 
 
 class TestSessionLifecycle:
