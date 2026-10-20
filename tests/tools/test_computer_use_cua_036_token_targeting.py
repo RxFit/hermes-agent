@@ -1,734 +1,674 @@
-"""Cua 0.36 strict token-only action schemas + structured window capture (T-271 backport).
+"""Verified Cua 0.36 flat-contract adaptation (T-271).
 
-Behaviour contracts for the installed monolithic ``cua_backend.py``:
+Scope is deliberately narrow.  The five tools observed on the installed driver (click, scroll,
+set_value, type_text, get_window_state) publish a flat ``additionalProperties: false`` object
+schema in which ``element_index`` does not exist and ``element_token`` is an explicitly declared
+string pattern.  Only a schema with exactly that shape is adapted:
 
-* A strict native action schema that names ``element_token`` but not ``element_index`` must be sent
-  the token alone; an element action with no token from the latest capture is refused locally and
-  never reaches the driver (so it cannot degrade to untargeted or coordinate input).
-* ``get_window_state`` asks for the structured ``elements`` tree through BOTH the MCP call and the CLI
-  re-fetch, only when the live schema accepts that exact value, so bounds / tokens / title survive.
-* Drivers with older schemas keep their legacy request shape.
+* a recognised element action sends the snapshot token INSTEAD of the index, but only when the
+  complete outbound payload validates; otherwise it is refused locally and never dispatched;
+* a recognised ``get_window_state`` asks for ``tree_format="elements"`` only when the complete
+  payload (including session, and on the CLI the real screenshot file) validates.
+
+Everything else (composed, permissive, malformed, boolean, undiscovered, unadvertised or
+unrecognised tools) must stay byte-for-byte what the installed baseline sent.
+
+The schemas come from ``fixtures/cua_036_cli_schemas.json`` (``cua-driver describe`` output).
+That is advertised metadata, not a daemon ``tools/list`` capture and not native acceptance; JSON
+validation proves admissibility, not targeting semantics.
 
 Upstream: NousResearch/hermes-agent#134857 (token-only targeting), #138596 (structured capture).
-Stdlib + pytest only; no live cua-driver, no real GUI.
+Stdlib + pytest only; no live cua-driver, no real GUI, no network.
 """
 
 from __future__ import annotations
 
+import copy
 import json
-import subprocess
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Callable, Dict
 from unittest.mock import MagicMock
 
+import jsonschema.validators
 import pytest
 
-from tools.computer_use import cua_backend
 from tools.computer_use.cua_backend import CuaDriverBackend
 
-_FORMAT = {"type": "string", "enum": ["markdown", "elements", "both"]}
-_ELEMENT_COUNT = 10  # indices 0 (AXWindow root) .. 9
+_FIXTURES = Path(__file__).parent / "fixtures"
+_METADATA = json.loads((_FIXTURES / "cua_036_cli_schemas.json").read_text(encoding="utf-8"))
+_SID = "test-session"
+_CAP = "accessibility.element_tokens"
+_OK = {"data": "ok", "images": [], "image_mime_types": [], "structuredContent": None, "isError": False}
 
 
-def _element(index: int, snapshot: str = "s1") -> Dict[str, Any]:
-    return {"element_index": index, "role": "AXWindow" if index == 0 else "AXButton",
-            "label": "Fixture" if index == 0 else f"Button {index}",
-            "element_token": f"{snapshot}:{index}",
-            "frame": {"x": index, "y": index * 2, "w": 30, "h": 40}}
+def _real(tool: str) -> Dict[str, Any]:
+    return copy.deepcopy(_METADATA["tools"][tool]["input_schema"])
 
 
-def _props(*names: str) -> Dict[str, Any]:
-    return {"type": "object", "properties": {n: {} for n in names}, "additionalProperties": False}
+def _tok(index: int) -> str:
+    return f"s0000002a:{index}"
 
 
-_ACTION_TOOLS = ("click", "double_click", "scroll", "set_value")
-_TOKEN_ONLY = {t: _props("pid", "window_id", "element_token", "button", "direction", "amount", "value")
-               for t in _ACTION_TOOLS}
-_ACCEPTS_BOTH = {t: _props("pid", "window_id", "element_index", "element_token", "button", "direction",
-                           "amount", "value") for t in _ACTION_TOOLS}
-_INDEX_ONLY = {t: _props("pid", "window_id", "element_index", "button", "direction", "amount", "value")
-               for t in _ACTION_TOOLS}
-
-
-def _backend(schemas: Dict[str, Any], tokens: Dict[int, str] | None = None) -> CuaDriverBackend:
+def _backend(schemas: Dict[str, Any] | None = None, tokens: Dict[int, str] | None = None,
+             capable: tuple[str, ...] = ()) -> CuaDriverBackend:
     backend = CuaDriverBackend()
-    backend._session._tool_schemas = schemas
-    backend._session._capabilities = {name: set() for name in schemas}
+    backend._session_id = _SID
+    backend._session._tool_schemas = dict(_all_real() if schemas is None else schemas)
+    backend._session._capabilities = {name: ({_CAP} if name in capable else set())
+                                      for name in backend._session._tool_schemas}
     backend._active_pid, backend._active_window_id = 111, 222
     backend._snapshot_tokens = dict(tokens or {})
-    backend._session.call_tool = MagicMock(return_value={
-        "data": "ok", "images": [], "image_mime_types": [], "structuredContent": None, "isError": False})
+    backend._session.call_tool = MagicMock(return_value=dict(_OK))
     return backend
 
 
-def _act(backend: CuaDriverBackend, tool: str, element: Any):
-    if tool == "click":
-        return backend.click(element=element)
-    if tool == "double_click":
-        return backend.click(element=element, click_count=2)
-    if tool == "scroll":
-        return backend.scroll(direction="down", element=element)
-    return backend.set_value("v", element=element)
+def _all_real() -> Dict[str, Any]:
+    return {name: _real(name) for name in _METADATA["tools"]}
 
 
-def _capture_with_elements(backend: CuaDriverBackend, count: int, snapshot: str) -> None:
-    """Drive the real capture() so tokens come from a (faked) structured driver response."""
-    elements = [_element(i, snapshot) for i in range(count)]
-    backend._session.call_tool = MagicMock(return_value={
-        "data": "", "images": ["cG5n"], "image_mime_types": [],
-        "structuredContent": {"tree_format": "elements", "elements": elements}, "isError": False})
-    backend.capture("ax", pid=111, window_id=222)
-    backend._session.call_tool = MagicMock(return_value={
-        "data": "ok", "images": [], "image_mime_types": [], "structuredContent": None, "isError": False})
+def _sent(backend: CuaDriverBackend) -> Dict[str, Any]:
+    assert backend._session.call_tool.call_count == 1
+    return backend._session.call_tool.call_args.args[1]
 
 
-# ---------------------------------------------------------------------------
-# 1 + 2: token-only schemas
-# ---------------------------------------------------------------------------
-
-@pytest.mark.parametrize("tool", _ACTION_TOOLS)
-@pytest.mark.parametrize("index", [0, 1, _ELEMENT_COUNT - 1], ids=["root-0", "first", "last"])
-def test_token_only_schema_sends_the_token_and_never_the_index(tool, index):
-    backend = _backend(_TOKEN_ONLY)
-    _capture_with_elements(backend, _ELEMENT_COUNT, "s1")
-    res = _act(backend, tool, index)
-    assert res.ok is True
-    name, args = backend._session.call_tool.call_args.args
-    assert name == tool
-    assert args["element_token"] == f"s1:{index}"
-    assert "element_index" not in args
+# tool -> (invoke(backend, element), ordinary fields Hermes builds before targeting)
+_ACTIONS: Dict[str, tuple[Callable[[CuaDriverBackend, Any], Any], Dict[str, Any]]] = {
+    "click": (lambda b, e: b.click(element=e), {"pid": 111, "button": "left", "window_id": 222}),
+    "scroll": (lambda b, e: b.scroll(direction="down", element=e),
+               {"pid": 111, "direction": "down", "amount": 3, "window_id": 222}),
+    "set_value": (lambda b, e: b.set_value("v", element=e), {"pid": 111, "window_id": 222, "value": "v"}),
+}
 
 
-@pytest.mark.parametrize("tool", _ACTION_TOOLS)
-@pytest.mark.parametrize("index", [0, 1, _ELEMENT_COUNT - 1], ids=["root-0", "first", "last"])
-def test_token_only_schema_refuses_an_index_with_no_token(tool, index):
-    backend = _backend(_TOKEN_ONLY, tokens={})
-    res = _act(backend, tool, index)
-    assert res.ok is False and res.code == "stale_element"
-    assert str(index) in res.message and "capture" in res.message
-    backend._session.call_tool.assert_not_called()
+def _tokenised(tool: str, index: int) -> Dict[str, Any]:
+    return {**_ACTIONS[tool][1], "element_token": _tok(index), "session": _SID}
 
 
-@pytest.mark.parametrize("tool", _ACTION_TOOLS)
-def test_token_only_schema_refuses_an_index_from_a_superseded_capture(tool):
-    backend = _backend(_TOKEN_ONLY)
-    _capture_with_elements(backend, _ELEMENT_COUNT, "s1")
-    _capture_with_elements(backend, 3, "s2")  # indices 3..9 no longer exist
-    assert _act(backend, tool, 2).ok is True
-    assert backend._session.call_tool.call_args.args[1]["element_token"] == "s2:2"
-    backend._session.call_tool.reset_mock()
-    res = _act(backend, tool, _ELEMENT_COUNT - 1)
-    assert res.ok is False and res.code == "stale_element"
-    backend._session.call_tool.assert_not_called()
+def _legacy(tool: str, index: Any) -> Dict[str, Any]:
+    return {**_ACTIONS[tool][1], "element_index": index, "session": _SID}
 
 
-@pytest.mark.parametrize("bad", ["5", 5.0, True, [5]], ids=["str", "float", "bool", "list"])
-def test_token_only_schema_refuses_a_non_integer_index(bad):
-    backend = _backend(_TOKEN_ONLY, tokens={0: "s1:0", 1: "s1:1", 5: "s1:5"})
-    res = backend.click(element=bad)
-    assert res.ok is False and res.code == "stale_element"
-    backend._session.call_tool.assert_not_called()
+def _no_validator(monkeypatch: pytest.MonkeyPatch) -> None:
+    def unavailable(*args: Any, **kwargs: Any) -> Any:
+        raise ImportError("jsonschema unavailable")
+    monkeypatch.setattr("jsonschema.validators.validator_for", unavailable)
 
 
-def test_a_fresh_capture_that_fails_disarms_the_previous_tokens():
-    backend = _backend(_TOKEN_ONLY)
-    _capture_with_elements(backend, _ELEMENT_COUNT, "s1")
-    backend._clear_active_target()
-    backend._active_pid, backend._active_window_id = 111, 222
-    res = backend.click(element=4)
-    assert res.ok is False and res.code == "stale_element"
-    backend._session.call_tool.assert_not_called()
+def _broken_validator(monkeypatch: pytest.MonkeyPatch, when: Callable[[Any], bool] = lambda i: True) -> None:
+    """Validation starts but evaluation raises (UNKNOWN), optionally only for some payloads."""
+    real = jsonschema.validators.validator_for
+
+    def patched(schema: Any, *args: Any, **kwargs: Any) -> Any:
+        base = real(schema, *args, **kwargs)
+        if args or kwargs:  # jsonschema's own metaschema lookup (passes default=): leave it alone
+            return base
+
+        class Broken:  # composition, not subclassing (jsonschema discourages subclassing)
+            check_schema = staticmethod(base.check_schema)
+
+            def __init__(self, schema: Any, **kw: Any) -> None:
+                self._inner = base(schema, **kw)
+
+            def is_valid(self, instance: Any) -> bool:
+                if when(instance):
+                    raise RuntimeError("evaluation failed")
+                return self._inner.is_valid(instance)
+        return Broken
+    monkeypatch.setattr("jsonschema.validators.validator_for", patched)
 
 
 # ---------------------------------------------------------------------------
-# Legacy / mixed schemas keep their behaviour
+# Fixture sanity: this is what "recognised" means.
 # ---------------------------------------------------------------------------
 
-def test_schema_accepting_both_keeps_index_beside_token():
-    backend = _backend(_ACCEPTS_BOTH, tokens={5: "s1:5"})
-    backend.click(element=5)
-    args = backend._session.call_tool.call_args.args[1]
-    assert args["element_index"] == 5 and args["element_token"] == "s1:5"
+def test_the_verified_metadata_is_the_flat_contract_for_exactly_five_tools():
+    assert _METADATA["version"] == "cua-driver 0.36.0"
+    assert set(_METADATA["tools"]) == {"click", "scroll", "set_value", "type_text", "get_window_state"}
+    for name, spec in _METADATA["tools"].items():
+        schema = spec["input_schema"]
+        assert schema["type"] == "object" and schema["additionalProperties"] is False, name
+        assert set(schema) <= {"type", "properties", "additionalProperties", "required"}, name
+        assert {"session", "pid"} <= set(schema["properties"]), name
+    for name in ("click", "scroll", "set_value", "type_text"):
+        properties = _real(name)["properties"]
+        assert "element_index" not in properties
+        assert properties["element_token"]["type"] == "string" and isinstance(properties["element_token"]["pattern"], str)
 
 
-def test_schema_accepting_both_does_not_refuse_a_tokenless_index():
-    backend = _backend(_ACCEPTS_BOTH, tokens={})
-    assert backend.click(element=5).ok is True
-    args = backend._session.call_tool.call_args.args[1]
-    assert args["element_index"] == 5 and "element_token" not in args
+# ---------------------------------------------------------------------------
+# Recognised element actions: token replaces the index, or local refusal with zero dispatch.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("tool", list(_ACTIONS))
+@pytest.mark.parametrize("index", [0, 1, 11, 4096])
+def test_recognised_action_sends_the_current_token_instead_of_the_index(tool, index):
+    backend = _backend(tokens={index: _tok(index), 99: _tok(99)})
+    result = _ACTIONS[tool][0](backend, index)
+    assert result.ok is True
+    assert _sent(backend) == _tokenised(tool, index)  # exact dict: no element_index, nothing lost
 
 
-def test_index_only_schema_never_receives_a_token_without_the_capability():
-    backend = _backend(_INDEX_ONLY, tokens={5: "s1:5"})
-    backend.click(element=5)
-    args = backend._session.call_tool.call_args.args[1]
-    assert args["element_index"] == 5 and "element_token" not in args
+def test_recognised_click_keeps_every_ordinary_field_and_the_foreground_choice():
+    backend = _backend(tokens={11: _tok(11)})
+    backend.click(element=11, button="right", modifiers=["ctrl"], delivery_mode="foreground")
+    assert _sent(backend) == {"pid": 111, "button": "right", "window_id": 222, "modifier": ["ctrl"],
+                              "delivery_mode": "foreground", "element_token": _tok(11), "session": _SID}
 
 
-def test_capability_advertised_token_is_still_attached_to_an_index_only_schema():
-    backend = _backend(_INDEX_ONLY, tokens={5: "s1:5"})
-    backend._session._capabilities["click"] = {"accessibility.element_tokens"}
-    backend.click(element=5)
-    args = backend._session.call_tool.call_args.args[1]
-    assert args["element_index"] == 5 and args["element_token"] == "s1:5"
+_BAD_TOKENS = {
+    "missing": {},
+    "token-for-another-index": {12: _tok(12)},
+    "empty": {11: ""},
+    "not-a-token": {11: "not-a-token"},
+    "uppercase-hex": {11: "S0000002A:11"},
+    "seven-hex-digits": {11: "s000002a:11"},
+    "trailing-text": {11: _tok(11) + " "},
+}
 
 
-def test_undiscovered_schema_is_not_treated_as_token_only():
-    backend = _backend({}, tokens={5: "s1:5"})
-    backend.click(element=5)
-    args = backend._session.call_tool.call_args.args[1]
-    assert args == {"pid": 111, "button": "left", "element_index": 5, "window_id": 222,
-                    "session": backend._session_id}
+@pytest.mark.parametrize("tool", list(_ACTIONS))
+@pytest.mark.parametrize("name", list(_BAD_TOKENS))
+def test_recognised_action_without_a_valid_current_token_is_refused_before_dispatch(tool, name):
+    backend = _backend(tokens=_BAD_TOKENS[name])
+    result = _ACTIONS[tool][0](backend, 11)
+    assert result.ok is False and result.code == "stale_element"
+    assert "11" in result.message and "capture" in result.message
+    backend._session.call_tool.assert_not_called()
 
 
-def test_coordinate_actions_are_unaffected_by_a_token_only_schema():
-    backend = _backend(_TOKEN_ONLY, tokens={})
+@pytest.mark.parametrize("tool", list(_ACTIONS))
+@pytest.mark.parametrize("element", [True, 11.0, "11", 1.5], ids=["bool", "float", "str", "fraction"])
+def test_recognised_action_never_aliases_a_bool_or_noninteger_to_a_cached_index(tool, element):
+    backend = _backend(tokens={1: _tok(1), 11: _tok(11)})
+    result = _ACTIONS[tool][0](backend, element)
+    assert result.ok is False and result.code == "stale_element" and "capture" in result.message
+    backend._session.call_tool.assert_not_called()
+
+
+@pytest.mark.parametrize("tool", list(_ACTIONS))
+def test_recognised_action_is_refused_when_the_validator_is_unavailable(monkeypatch, tool):
+    _no_validator(monkeypatch)
+    backend = _backend(tokens={11: _tok(11)})
+    result = _ACTIONS[tool][0](backend, 11)
+    assert result.ok is False and result.code == "stale_element" and "capture" in result.message
+    backend._session.call_tool.assert_not_called()
+
+
+@pytest.mark.parametrize("tool", list(_ACTIONS))
+def test_recognised_action_is_refused_when_evaluation_is_unknown(monkeypatch, tool):
+    _broken_validator(monkeypatch)
+    backend = _backend(tokens={11: _tok(11)})
+    result = _ACTIONS[tool][0](backend, 11)
+    assert result.ok is False and result.code == "stale_element" and "capture" in result.message
+    backend._session.call_tool.assert_not_called()
+
+
+def test_a_driver_stale_verdict_is_the_drivers_own_response_and_is_not_retried():
+    backend = _backend(tokens={11: _tok(11)})
+    backend._session.call_tool.return_value = {
+        "data": "stale", "images": [], "image_mime_types": [], "isError": True,
+        "structuredContent": {"code": "snapshot_superseded", "message": "token superseded by a newer read"}}
+    result = backend.click(element=11)
+    assert result.ok is False and result.code == "snapshot_superseded"
+    assert backend._session.call_tool.call_count == 1  # no retry introduced here
+
+
+def test_a_recognised_scroll_with_an_element_but_no_window_never_falls_through():
+    for coords in ({}, {"x": 1, "y": 2}):
+        backend = _backend(tokens={11: _tok(11)})
+        backend._active_window_id = None
+        result = backend.scroll(direction="down", element=11, **coords)
+        assert result.ok is False
+        backend._session.call_tool.assert_not_called()
+
+
+def test_type_text_has_no_element_path_and_sends_the_baseline_payload():
+    backend = _backend(tokens={11: _tok(11)})
+    assert backend.type_text("hello").ok is True
+    assert _sent(backend) == {"pid": 111, "window_id": 222, "text": "hello", "session": _SID}
+
+
+def test_coordinate_actions_on_recognised_schemas_are_untouched():
+    backend = _backend(tokens={11: _tok(11)})
     assert backend.click(x=10, y=20).ok is True
-    args = backend._session.call_tool.call_args.args[1]
-    assert (args["x"], args["y"]) == (10, 20) and "element_index" not in args and "element_token" not in args
+    assert _sent(backend) == {"pid": 111, "button": "left", "x": 10, "y": 20, "window_id": 222, "session": _SID}
 
 
-@pytest.mark.parametrize("schemas", [_TOKEN_ONLY, _ACCEPTS_BOTH, {}], ids=["token-only", "both", "undiscovered"])
-@pytest.mark.parametrize("coords", [{}, {"x": 1, "y": 2}], ids=["no-coords", "coords"])
-def test_element_scroll_without_a_window_fails_closed_instead_of_scrolling_untargeted(schemas, coords):
-    backend = _backend(schemas, tokens={5: "s1:5"})
+# ---------------------------------------------------------------------------
+# Negative eligibility: everything outside the observed flat contract is baseline-identical.
+# ---------------------------------------------------------------------------
+
+_MANAGER_ONEOF = {"oneOf": [
+    {"type": "object", "properties": {"element_index": {"type": "integer"}},
+     "required": ["element_index"], "additionalProperties": False},
+    {"type": "object", "properties": {"element_token": {"type": "string"}},
+     "required": ["element_token"], "additionalProperties": False}]}
+_MANAGER_Z_PROBE = {"type": "object", "properties": {"pid": {"type": "integer"}},
+                    "allOf": [{"not": {"required": ["element_index"]}}, {"minProperties": 2},
+                              {"propertyNames": {"not": {"const": "x-hermes-unrelated-probe"}}}]}
+_REVIEW_Z_FAMILY = {
+    "patternProperties+minProperties": {
+        "type": "object", "minProperties": 3,
+        "properties": {"pid": {"type": "integer"}, "session": {"type": "string"}},
+        "patternProperties": {"^element_": {"type": "string"}}, "additionalProperties": False},
+    "propertyNames": {
+        "type": "object", "minProperties": 3,
+        "properties": {"pid": {"type": "integer"}, "session": {"type": "string"}, "element_index": False},
+        "propertyNames": {"pattern": "^(pid|session|element_[a-z]+)$"}, "additionalProperties": True},
+    "not": {
+        "type": "object", "minProperties": 3,
+        "properties": {"pid": {"type": "integer"}, "session": {"type": "string"}},
+        "not": {"anyOf": [{"required": ["element_index"]}, {"required": ["x-hermes-unrelated-probe"]}]},
+        "additionalProperties": True},
+    "conditionals": {
+        "type": "object", "minProperties": 3,
+        "properties": {"pid": {"type": "integer"}, "session": {"type": "string"}},
+        "allOf": [{"if": {"required": ["element_index"]}, "then": False},
+                  {"if": {"required": ["x-hermes-unrelated-probe"]}, "then": False}],
+        "additionalProperties": True},
+}
+
+
+def _ineligible_click_schemas() -> Dict[str, Any]:
+    base = _real("click")
+
+    def with_(**keywords: Any) -> Dict[str, Any]:
+        return {**base, **keywords}
+
+    def with_props(**props: Any) -> Dict[str, Any]:
+        return {**base, "properties": {**base["properties"], **props}}
+
+    def without(key: str) -> Dict[str, Any]:
+        return {k: v for k, v in base.items() if k != key}
+
+    return {
+        "oneOf-manager-repro": _MANAGER_ONEOF,
+        "z-probe-manager": _MANAGER_Z_PROBE,
+        **{f"z-family-{k}": v for k, v in _REVIEW_Z_FAMILY.items()},
+        "allOf-wrapper": {"allOf": [base]},
+        "anyOf-wrapper": {"anyOf": [base, {"type": "object"}]},
+        "ref-wrapper": {"$ref": "#/$defs/click", "$defs": {"click": base}},
+        "if-then": with_(**{"if": {"required": ["pid"]}, "then": {}}),
+        "dependentRequired": with_(dependentRequired={"button": ["pid"]}),
+        "dependentSchemas": with_(dependentSchemas={"button": {}}),
+        "patternProperties": with_(patternProperties={"^x_": {}}),
+        "extra-root-title": with_(title="click"),
+        "extra-root-defs": with_(**{"$defs": {}}),
+        "additionalProperties-omitted": without("additionalProperties"),
+        "additionalProperties-true": with_(additionalProperties=True),
+        "additionalProperties-schema": with_(additionalProperties={"type": "string"}),
+        "type-missing": without("type"),
+        "type-string": with_(type="string"),
+        "type-list": with_(type=["object", "null"]),
+        "properties-list": with_(properties=[]),
+        "properties-missing": without("properties"),
+        "boolean-true": True,
+        "boolean-false": False,
+        "list-root": [base],
+        "malformed-required": with_(required="pid"),
+        "duplicate-required": with_(required=["pid", "pid"]),
+        "element-index-declared": with_props(element_index={"type": "integer"}),
+        "token-unadvertised": {**base, "properties": {k: v for k, v in base["properties"].items()
+                                                      if k != "element_token"}},
+        "token-false": with_props(element_token=False),
+        "token-true": with_props(element_token=True),
+        "token-without-pattern": with_props(element_token={"type": "string"}),
+        "token-pattern-without-type": with_props(element_token={"pattern": "^s"}),
+        "token-integer": with_props(element_token={"type": "integer", "pattern": "^s"}),
+    }
+
+
+_INELIGIBLE = _ineligible_click_schemas()
+
+
+@pytest.mark.parametrize("name", list(_INELIGIBLE))
+def test_an_ineligible_schema_keeps_the_exact_baseline_request(name):
+    backend = _backend({"click": _INELIGIBLE[name]}, tokens={11: _tok(11)})
+    assert backend.click(element=11).ok is True
+    assert _sent(backend) == _legacy("click", 11)  # index kept, no new token, no refusal
+
+
+@pytest.mark.parametrize("name", list(_INELIGIBLE))
+def test_an_ineligible_schema_keeps_the_historical_capability_attachment(name):
+    backend = _backend({"click": _INELIGIBLE[name]}, tokens={11: _tok(11)}, capable=("click",))
+    assert backend.click(element=11).ok is True
+    assert _sent(backend) == {**_legacy("click", 11), "element_token": _tok(11)}
+
+
+@pytest.mark.parametrize("name", list(_INELIGIBLE))
+def test_an_ineligible_schema_never_refuses_a_tokenless_index(name):
+    backend = _backend({"click": _INELIGIBLE[name]}, tokens={})
+    assert backend.click(element=0).ok is True
+    assert _sent(backend) == _legacy("click", 0)
+
+
+def test_an_unrecognised_tool_name_is_never_adapted():
+    backend = _backend(tokens={11: _tok(11)})  # all five real schemas are present, double_click is not
+    assert backend.click(element=11, click_count=2).ok is True
+    assert _sent(backend) == {"pid": 111, "button": "left", "element_index": 11, "window_id": 222,
+                              "session": _SID}
+    assert backend._session.call_tool.call_args.args[0] == "double_click"
+
+
+@pytest.mark.parametrize("tool", list(_ACTIONS))
+def test_a_recognised_looking_schema_under_an_unrecognised_name_is_not_adapted(tool):
+    backend = _backend({tool: _real(tool), "double_click": _real("click")}, tokens={11: _tok(11)})
+    backend.click(element=11, click_count=2)
+    assert _sent(backend) == {"pid": 111, "button": "left", "element_index": 11, "window_id": 222,
+                              "session": _SID}
+
+
+def test_no_discovered_schema_keeps_the_historical_capability_attachment():
+    backend = _backend({}, tokens={11: _tok(11)}, capable=("click",))
+    backend._session._capabilities = {"click": {_CAP}}
+    assert backend.click(element=11).ok is True
+    assert _sent(backend) == {**_legacy("click", 11), "element_token": _tok(11)}
+
+
+def test_no_discovered_schema_and_no_capability_sends_only_the_index():
+    backend = _backend({}, tokens={11: _tok(11)})
+    assert backend.click(element=11).ok is True
+    assert _sent(backend) == _legacy("click", 11)
+
+
+def test_the_older_0_9_driver_fixture_keeps_index_and_capability_token_beside_each_other():
+    listing = json.loads((Path(__file__).parents[1] / "fixtures" / "cua_driver_0_9_tools_list.json")
+                         .read_text(encoding="utf-8"))
+    click = next(tool for tool in listing["tools"] if tool["name"] == "click")
+    backend = _backend({"click": click["inputSchema"]}, tokens={5: "tok5"})
+    backend._session._capabilities = {"click": set(click["capabilities"])}
+    assert backend.click(element=5).ok is True
+    assert _sent(backend) == {**_legacy("click", 5), "element_token": "tok5"}
+
+
+def test_the_manager_oneof_failure_keeps_a_valid_index_only_request():
+    backend = _backend({"click": _MANAGER_ONEOF}, tokens={1: "tok_synthetic"})
+    backend._active_pid = backend._active_window_id = None
+    res = backend._action("click", {"element_index": 1})
+    assert res.ok is True
+    assert backend._session.call_tool.call_args.args[1] == {"element_index": 1, "session": _SID}
+
+
+def test_a_nonrecognised_flat_schema_for_a_scroll_without_a_window_keeps_the_baseline_request():
+    backend = _backend({"scroll": {}}, tokens={11: _tok(11)})
     backend._active_window_id = None
-    res = backend.scroll(direction="down", element=5, **coords)
-    assert res.ok is False
-    backend._session.call_tool.assert_not_called()
+    assert backend.scroll(direction="down", element=11).ok is True
+    assert _sent(backend) == {"pid": 111, "direction": "down", "amount": 3, "session": _SID}
 
 
 # ---------------------------------------------------------------------------
-# 3: structured capture, MCP + CLI
+# Capture: structured `elements` view, MCP and CLI re-fetch.
 # ---------------------------------------------------------------------------
 
-_LEGACY_ARGS = {"pid": 101, "window_id": 202, "session": "test-session"}
+_LG = {"pid": 101, "window_id": 202, "session": _SID}  # installed-baseline get_window_state request
+_C = {**_LG, "tree_format": "elements"}
+_WINDOW = {"element_index": 0, "role": "AXWindow", "label": "Fixture",
+           "element_token": "s1234abcd:0", "frame": {"x": 0, "y": 0, "w": 800, "h": 600}}
+_BUTTON = {"element_index": 7, "role": "AXButton", "label": "Increment",
+           "element_token": "s1234abcd:7", "frame": {"x": 10, "y": 20, "w": 30, "h": 40}}
+_ELEMENTS_RESPONSE = {
+    "data": "window_id=202 pid=101 elements=2 snapshot_id=s1234abcd\n\n(tree is in structuredContent.elements)",
+    "images": ["cG5n"], "image_mime_types": [], "isError": False,
+    "structuredContent": {"tree_format": "elements", "snapshot_id": "s1234abcd", "elements": [_WINDOW, _BUTTON]}}
+_EMPTY = {"data": "", "images": [], "image_mime_types": [], "structuredContent": None, "isError": False}
 
 
-def _capture_backend(schema: Any) -> CuaDriverBackend:
-    backend = CuaDriverBackend()
-    backend._session_id = "test-session"
-    backend._session._tool_schemas = {"get_window_state": schema}
-    backend._session._capabilities = {"get_window_state": set()}
-    backend._session._embedded_daemon = None
+def _capture_backend(schema: Any = None) -> CuaDriverBackend:
+    schemas = {"get_window_state": _real("get_window_state") if schema is None else schema}
+    backend = _backend(schemas)
+    backend._active_pid = backend._active_window_id = None
     return backend
 
 
-def _elements_response(**extra: Any) -> Dict[str, Any]:
-    return {"data": "window_id=202 pid=101 elements=2 snapshot_id=s9\n\n(tree is in structuredContent.elements)",
-            "images": ["cG5n"], "image_mime_types": [],
-            "structuredContent": {"tree_format": "elements", "snapshot_id": "s9",
-                                  "elements": [_element(0, "s9"), _element(7, "s9")], **extra},
-            "isError": False}
-
-
-@pytest.mark.parametrize(("schema", "requested"), [
-    ({"properties": {"tree_format": _FORMAT}}, True),
-    ({"properties": {"tree_format": {"type": "string"}}}, True),
-    (None, False),
-    ({}, False),
-    ({"properties": []}, False),
-    ({"properties": {}}, False),
-    ({"properties": {"tree_format": {"enum": ["markdown", "both"]}}}, False),
-    ({"properties": {"tree_format": {"type": "integer"}}}, False),
-    ({"properties": {"tree_format": {"$ref": "https://invalid.example/schema"}}}, False),
-])
-def test_structured_view_is_requested_only_when_the_schema_accepts_it(monkeypatch, schema, requested):
-    backend = _capture_backend(schema)
-    backend._active_pid, backend._active_window_id = 101, 202
-    remote_reads: List[Any] = []
-    monkeypatch.setattr("urllib.request.urlopen", lambda *a, **k: remote_reads.append(a))
-    expected = dict(_LEGACY_ARGS, **({"tree_format": "elements"} if requested else {}))
-    assert backend._gws_args(structured=True) == expected
-    assert backend._gws_args() == _LEGACY_ARGS  # vision/other callers keep the compact default
-    assert remote_reads == []
+def _mcp_requests(backend: CuaDriverBackend, response: Dict[str, Any]) -> list[Dict[str, Any]]:
+    seen: list[Dict[str, Any]] = []
+    backend._session.call_tool = MagicMock(side_effect=lambda name, args, **kw: seen.append(dict(args)) or response)
+    return seen
 
 
 @pytest.mark.parametrize(("mode", "extra", "title"), [
-    ("ax", {"window_title": "WindowServer title"}, "WindowServer title"),
+    ("ax", {"window_title": "Driver title"}, "Driver title"),
     ("som", {}, "Fixture"),
 ])
-def test_elements_only_capture_keeps_title_bounds_and_tokens(mode, extra, title):
-    backend = _capture_backend({"properties": {"tree_format": _FORMAT}})
-    response = _elements_response(**extra)
-    backend._session.call_tool = MagicMock(side_effect=lambda name, args, **kw: response)
+def test_recognised_capture_requests_elements_and_keeps_frames_title_and_tokens(mode, extra, title):
+    backend = _capture_backend()
+    response = {**_ELEMENTS_RESPONSE,
+                "structuredContent": {**_ELEMENTS_RESPONSE["structuredContent"], **extra}}
+    seen = _mcp_requests(backend, response)
     cap = backend.capture(mode, pid=101, window_id=202)
-    assert cap.window_title == title
+    assert seen == [_C]
+    assert cap.window_title == title and cap.png_b64 == "cG5n"
     assert [(e.index, e.bounds, e.element_token) for e in cap.elements] == [
-        (0, (0, 0, 30, 40), "s9:0"), (7, (7, 14, 30, 40), "s9:7")]
-    assert backend._snapshot_tokens == {0: "s9:0", 7: "s9:7"}
-    assert cap.png_b64 == "cG5n"
-    name, args = backend._session.call_tool.call_args.args
-    assert name == "get_window_state" and args["tree_format"] == "elements"
+        (0, (0, 0, 800, 600), "s1234abcd:0"), (7, (10, 20, 30, 40), "s1234abcd:7")]
+    assert backend._snapshot_tokens == {0: "s1234abcd:0", 7: "s1234abcd:7"}
 
 
-def test_markdown_title_still_wins_when_the_driver_sends_a_markdown_tree():
-    backend = _capture_backend({})
-    backend._session.call_tool = MagicMock(return_value={
-        "data": '2 elements\n- [0] AXWindow "Legacy title"\n- [1] AXButton "OK"', "images": ["cG5n"],
-        "image_mime_types": [], "structuredContent": None, "isError": False})
-    cap = backend.capture("ax", pid=101, window_id=202)
-    assert cap.window_title == "Legacy title"
-    assert [e.index for e in cap.elements] == [0, 1]
-    assert backend._session.call_tool.call_args.args[1] == _LEGACY_ARGS
+def test_a_capture_then_a_recognised_action_uses_the_captured_token_end_to_end():
+    backend = _capture_backend()
+    backend._session._tool_schemas["click"] = _real("click")
+    _mcp_requests(backend, _ELEMENTS_RESPONSE)
+    backend.capture("ax", pid=101, window_id=202)
+    backend._session.call_tool = MagicMock(return_value=dict(_OK))
+    assert backend.click(element=7).ok is True
+    assert _sent(backend) == {"pid": 101, "button": "left", "window_id": 202,
+                              "element_token": "s1234abcd:7", "session": _SID}
 
 
-@pytest.mark.parametrize("mode", ["ax", "som", "vision"])
-def test_mcp_and_cli_refetch_request_the_same_view(monkeypatch, mode):
-    backend = _capture_backend({"properties": {"tree_format": _FORMAT}})
-    mcp_requests: List[Dict[str, Any]] = []
-    cli_requests: List[Dict[str, Any]] = []
-    shot_files: List[Path] = []
-    # MCP answers with a degenerate result, forcing the CLI re-fetch.
-    backend._session.call_tool = MagicMock(side_effect=lambda name, args, **kw: mcp_requests.append(dict(args)) or {
-        "data": "", "images": [], "image_mime_types": [], "structuredContent": None, "isError": False})
+def test_vision_capture_never_gains_tree_format_on_mcp():
+    backend = _capture_backend()
+    seen = _mcp_requests(backend, _ELEMENTS_RESPONSE)
+    cap = backend.capture("vision", pid=101, window_id=202)
+    assert seen == [_LG]
+    assert cap.png_b64 == "cG5n" and cap.elements == [] and backend._snapshot_tokens == {}
+
+
+def _install_cli(monkeypatch, body: Dict[str, Any], cli_requests: list, shot_files: list) -> None:
+    import subprocess
     monkeypatch.setattr("tools.computer_use.cua_backend.resolve_cua_driver_cmd", lambda *a, **k: "unused-driver")
 
     def fake_run(cmd, **kwargs):
         assert cmd[:3] == ["unused-driver", "call", "get_window_state"]
         args = json.loads(cmd[3])
-        shot = Path(args.pop("screenshot_out_file"))
-        assert shot.is_file()
-        shot_files.append(shot)
+        shot_files.append(Path(args["screenshot_out_file"]))
+        assert shot_files[-1].is_file()
         cli_requests.append(args)
-        body = {**_elements_response()["structuredContent"], "screenshot_png_b64": "cG5n"}
         return MagicMock(returncode=0, stdout=json.dumps(body), stderr="")
-
     monkeypatch.setattr(subprocess, "run", fake_run)
+
+
+def _without_file(request: Dict[str, Any]) -> Dict[str, Any]:
+    return {k: v for k, v in request.items() if k != "screenshot_out_file"}
+
+
+@pytest.mark.parametrize("mode", ["ax", "som"])
+def test_the_cli_refetch_keeps_the_validated_view_plus_the_real_screenshot_file(monkeypatch, mode):
+    backend = _capture_backend()
+    mcp = _mcp_requests(backend, _EMPTY)  # degenerate MCP result forces the CLI re-fetch
+    cli: list = []
+    files: list = []
+    _install_cli(monkeypatch, {**_ELEMENTS_RESPONSE["structuredContent"], "screenshot_png_b64": "cG5n"}, cli, files)
     cap = backend.capture(mode, pid=101, window_id=202)
-    expected = dict(_LEGACY_ARGS)
-    if mode != "vision":
-        expected["tree_format"] = "elements"
-        assert [e.element_token for e in cap.elements] == ["s9:0", "s9:7"]
-        assert cap.window_title == "Fixture"
-        assert backend._snapshot_tokens == {0: "s9:0", 7: "s9:7"}
-    else:
-        assert cap.elements == [] and backend._snapshot_tokens == {}
-    assert mcp_requests == [expected] and cli_requests == [expected]
-    assert cap.png_b64 == "cG5n"
-    assert all(not shot.exists() for shot in shot_files)
+    assert mcp == [_C]
+    assert len(cli) == 1 and "screenshot_out_file" in cli[0] and _without_file(cli[0]) == _C
+    assert [e.element_token for e in cap.elements] == ["s1234abcd:0", "s1234abcd:7"]
+    assert cap.window_title == "Fixture" and cap.png_b64 == "cG5n"
+    assert all(not f.exists() for f in files)
 
 
-def test_vision_ignores_elements_and_keeps_the_compact_request():
-    backend = _capture_backend({"properties": {"tree_format": _FORMAT}})
-    backend._session.call_tool = MagicMock(side_effect=lambda name, args, **kw: _elements_response())
+def test_the_vision_cli_refetch_keeps_the_baseline_request_plus_the_file(monkeypatch):
+    backend = _capture_backend()
+    mcp = _mcp_requests(backend, _EMPTY)
+    cli: list = []
+    files: list = []
+    _install_cli(monkeypatch, {"screenshot_png_b64": "cG5n"}, cli, files)
     cap = backend.capture("vision", pid=101, window_id=202)
-    assert backend._session.call_tool.call_args.args[1] == _LEGACY_ARGS
-    assert cap.png_b64 == "cG5n" and cap.elements == [] and backend._snapshot_tokens == {}
+    assert mcp == [_LG] and len(cli) == 1 and _without_file(cli[0]) == _LG
+    assert cap.png_b64 == "cG5n" and cap.elements == []
+    assert all(not f.exists() for f in files)
 
 
-def test_mock_session_without_schema_support_keeps_the_legacy_request():
-    """Sessions that cannot positively confirm the value (e.g. mocks) must not get tree_format."""
-    backend = CuaDriverBackend()
-    backend._session = MagicMock()
-    backend._active_pid, backend._active_window_id = 101, 202
-    assert "tree_format" not in backend._gws_args(structured=True)
+_MARKDOWN_BODY = {"element_count": 1, "tree_markdown": '- [3] AXButton "OK"', "screenshot_png_b64": "cG5n"}
+
+
+def test_an_invalid_file_augmented_cli_request_drops_only_the_added_tree_format(monkeypatch):
+    schema = _real("get_window_state")
+    del schema["properties"]["screenshot_out_file"]  # MCP request still valid, CLI request is not
+    backend = _capture_backend(schema)
+    mcp = _mcp_requests(backend, _EMPTY)
+    cli: list = []
+    files: list = []
+    _install_cli(monkeypatch, _MARKDOWN_BODY, cli, files)
+    cap = backend.capture("ax", pid=101, window_id=202)
+    assert mcp == [_C]
+    assert len(cli) == 1 and "screenshot_out_file" in cli[0] and _without_file(cli[0]) == _LG
+    assert [(e.index, e.label) for e in cap.elements] == [(3, "OK")]  # markdown fallback preserved
+    assert all(not f.exists() for f in files)
+
+
+def test_an_unknown_file_augmented_cli_validation_drops_only_the_added_tree_format(monkeypatch):
+    backend = _capture_backend()
+    mcp = _mcp_requests(backend, _EMPTY)
+    cli: list = []
+    files: list = []
+    _install_cli(monkeypatch, _MARKDOWN_BODY, cli, files)
+    _broken_validator(monkeypatch, when=lambda instance: "screenshot_out_file" in instance)
+    backend.capture("ax", pid=101, window_id=202)
+    assert mcp == [_C]  # the MCP request validated before the file existed
+    assert len(cli) == 1 and _without_file(cli[0]) == _LG and "screenshot_out_file" in cli[0]
+
+
+@pytest.mark.parametrize("breakage", ["unavailable", "unknown"])
+def test_without_a_usable_validator_capture_sends_the_baseline_request(monkeypatch, breakage):
+    (_no_validator if breakage == "unavailable" else _broken_validator)(monkeypatch)
+    backend = _capture_backend()
+    seen = _mcp_requests(backend, _EMPTY)
+    cli: list = []
+    files: list = []
+    _install_cli(monkeypatch, _MARKDOWN_BODY, cli, files)
+    backend.capture("ax", pid=101, window_id=202)
+    assert seen == [_LG] and len(cli) == 1 and _without_file(cli[0]) == _LG
+
+
+def test_an_invalid_structured_request_falls_back_to_the_baseline_request():
+    schema = _real("get_window_state")
+    schema["required"] = ["pid", "window_id", "undeclared_but_required"]  # nothing can satisfy it
+    backend = _capture_backend(schema)
+    seen = _mcp_requests(backend, _ELEMENTS_RESPONSE)
+    backend.capture("ax", pid=101, window_id=202)
+    assert seen == [_LG]
+
+
+def _ineligible_capture_schemas() -> Dict[str, Any]:
+    base = _real("get_window_state")
+
+    def with_(**keywords: Any) -> Dict[str, Any]:
+        return {**base, **keywords}
+
+    def with_format(value: Any) -> Dict[str, Any]:
+        return {**base, "properties": {**base["properties"], "tree_format": value}}
+
+    return {
+        "allOf-markdown-only-manager-repro": {
+            "type": "object", "properties": {"tree_format": {}},
+            "allOf": [{"properties": {"tree_format": {"enum": ["markdown"]}}}]},
+        "allOf-wrapper": {"allOf": [base]},
+        "oneOf-wrapper": {"oneOf": [base]},
+        "ref-wrapper": {"$ref": "#/$defs/w", "$defs": {"w": base}},
+        "if-then": with_(**{"if": {"required": ["pid"]}, "then": {}}),
+        "dependentRequired": with_(dependentRequired={"tree_format": ["pid"]}),
+        "extra-root-title": with_(title="x"),
+        "additionalProperties-omitted": {k: v for k, v in base.items() if k != "additionalProperties"},
+        "additionalProperties-true": with_(additionalProperties=True),
+        "type-missing": {k: v for k, v in base.items() if k != "type"},
+        "boolean-true": True,
+        "boolean-false": False,
+        "list-root": [base],
+        "tree-format-undeclared": {**base, "properties": {k: v for k, v in base["properties"].items()
+                                                          if k != "tree_format"}},
+        "tree-format-empty-schema": with_format({}),
+        "tree-format-true": with_format(True),
+        "tree-format-false": with_format(False),
+        "tree-format-no-elements": with_format({"type": "string", "enum": ["markdown", "both"]}),
+        "tree-format-no-enum": with_format({"type": "string"}),
+        "tree-format-no-type": with_format({"enum": ["markdown", "elements", "both"]}),
+        "tree-format-integer": with_format({"type": "integer"}),
+        "tree-format-ref": with_format({"$ref": "#/$defs/f"}),
+    }
+
+
+_INELIGIBLE_CAPTURE = _ineligible_capture_schemas()
+
+
+@pytest.mark.parametrize("name", list(_INELIGIBLE_CAPTURE))
+def test_an_ineligible_capture_schema_keeps_the_baseline_request(name):
+    backend = _capture_backend(_INELIGIBLE_CAPTURE[name])
+    seen = _mcp_requests(backend, _ELEMENTS_RESPONSE)
+    backend.capture("ax", pid=101, window_id=202)
+    assert seen == [_LG]
+
+
+def test_an_undiscovered_capture_schema_keeps_the_baseline_request_and_markdown_parsing():
+    backend = _backend({})
+    backend._active_pid = backend._active_window_id = None
+    seen = _mcp_requests(backend, {"data": '1 elements\n- [0] AXWindow "Legacy title"\n- [1] AXButton "OK"',
+                                   "images": ["cG5n"], "image_mime_types": [], "structuredContent": None,
+                                   "isError": False})
+    cap = backend.capture("ax", pid=101, window_id=202)
+    assert seen == [_LG] and cap.window_title == "Legacy title" and [e.index for e in cap.elements] == [0, 1]
+
+
+def test_a_failed_capture_disarms_previous_tokens_so_a_recognised_action_is_refused():
+    backend = _backend(tokens={11: _tok(11)})
+    backend._clear_active_target()
+    backend._active_pid, backend._active_window_id = 111, 222
+    result = backend.click(element=11)
+    assert result.ok is False and result.code == "stale_element"
+    backend._session.call_tool.assert_not_called()
 
 
 def test_reconnect_clears_cached_schemas_with_the_capabilities():
-    session = cua_backend._CuaDriverSession.__new__(cua_backend._CuaDriverSession)
+    session = CuaDriverBackend()._session
     session._started, session._capabilities, session._capability_version = False, {"click": {"x"}}, "v"
-    session._tool_schemas = {"click": _props("element_token")}
+    session._tool_schemas = {"click": _real("click")}
     session._start_lifecycle_locked = lambda: None
     session._restart_session_locked()
     assert session._capabilities == {} and session._tool_schemas == {}
 
 
 # ---------------------------------------------------------------------------
-# Token-only classification needs POSITIVE evidence that element_index is forbidden.
-# Omitting a property from ``properties`` does not forbid it under JSON Schema.
+# Remote schema references are never retrieved.
 # ---------------------------------------------------------------------------
 
-_TOKEN_PROPS = {"pid": {"type": "integer"}, "window_id": {"type": "integer"}, "element_token": {"type": "string"}}
+def _record_network(monkeypatch: pytest.MonkeyPatch) -> list:
+    reads: list = []
+    monkeypatch.setattr("urllib.request.urlopen", lambda *a, **k: reads.append(a))
+    return reads
 
 
-def _click_schema(**keywords: Any) -> Dict[str, Any]:
-    return {"type": "object", "properties": dict(_TOKEN_PROPS), **keywords}
+def test_a_remote_reference_on_an_ineligible_schema_is_never_fetched(monkeypatch):
+    reads = _record_network(monkeypatch)
+    backend = _backend({"click": {"$ref": "https://invalid.example/click.json"}}, tokens={11: _tok(11)})
+    assert backend.click(element=11).ok is True
+    assert _sent(backend) == _legacy("click", 11) and reads == []
 
 
-# Schemas that positively forbid element_index while accepting element_token.
-_FORBIDS_INDEX = {
-    "strict": _click_schema(additionalProperties=False),
-    "strict-with-unrelated-required": _click_schema(additionalProperties=False, required=["pid", "window_id"]),
-    "boolean-false-index": _click_schema(properties={**_TOKEN_PROPS, "element_index": False}),
-    "local-ref-false-index": _click_schema(properties={**_TOKEN_PROPS, "element_index": {"$ref": "#/$defs/never"}},
-                                           **{"$defs": {"never": False}}),
-    "composed-via-local-ref": {"allOf": [{"$ref": "#/$defs/target"}],
-                               "$defs": {"target": _click_schema(additionalProperties=False)}},
-    "unevaluated-properties-false": {"type": "object", "allOf": [{"properties": dict(_TOKEN_PROPS)}],
-                                     "unevaluatedProperties": False},
-}
-
-# Schemas that declare element_token but still PERMIT element_index (or whose support is unknown).
-_PERMITS_INDEX = {
-    "additionalProperties-omitted": _click_schema(),
-    "additionalProperties-true": _click_schema(additionalProperties=True),
-    "additionalProperties-empty-schema": _click_schema(additionalProperties={}),
-    "unrelated-required-does-not-forbid": _click_schema(required=["pid", "element_token"]),
-    "composed-permissive": {"allOf": [_click_schema(), {"properties": {"button": {"type": "string"}}}]},
-    "unknown-oneOf-required": _click_schema(oneOf=[{"required": ["pid"]}, {"required": ["window_id"]}]),
-    "remote-ref-property-unresolvable": _click_schema(
-        properties={**_TOKEN_PROPS, "button": {"$ref": "https://invalid.example/button.json"}}),
-    "index-declared": _click_schema(properties={**_TOKEN_PROPS, "element_index": {"type": "integer"}},
-                                    additionalProperties=False),
-}
-
-
-@pytest.mark.parametrize("tool", ["click", "set_value"])
-@pytest.mark.parametrize("name", list(_FORBIDS_INDEX))
-@pytest.mark.parametrize("index", [0, 1, _ELEMENT_COUNT - 1], ids=["root-0", "first", "last"])
-def test_positive_prohibition_of_the_index_makes_the_schema_token_only(name, tool, index):
-    backend = _backend({tool: _FORBIDS_INDEX[name]}, tokens={i: f"s1:{i}" for i in range(_ELEMENT_COUNT)})
-    assert _act(backend, tool, index).ok is True
-    args = backend._session.call_tool.call_args.args[1]
-    assert args["element_token"] == f"s1:{index}" and "element_index" not in args
-
-
-@pytest.mark.parametrize("name", list(_FORBIDS_INDEX))
-def test_positive_prohibition_of_the_index_still_refuses_a_tokenless_index(name):
-    backend = _backend({"click": _FORBIDS_INDEX[name]}, tokens={1: "s1:1"})
-    res = backend.click(element=0)
-    assert res.ok is False and res.code == "stale_element"
+@pytest.mark.parametrize("tool", list(_ACTIONS))
+def test_a_remote_reference_inside_a_recognised_schema_is_unknown_so_the_action_is_refused(monkeypatch, tool):
+    reads = _record_network(monkeypatch)
+    schema = _real(tool)
+    schema["properties"]["session"] = {"$ref": "https://invalid.example/session.json"}
+    backend = _backend({**_all_real(), tool: schema}, tokens={11: _tok(11)})
+    result = _ACTIONS[tool][0](backend, 11)
+    assert result.ok is False and result.code == "stale_element" and "capture" in result.message
     backend._session.call_tool.assert_not_called()
-
-
-@pytest.mark.parametrize("tool", ["click", "set_value"])
-@pytest.mark.parametrize("name", list(_PERMITS_INDEX))
-@pytest.mark.parametrize("index", [0, 1, _ELEMENT_COUNT - 1], ids=["root-0", "first", "last"])
-def test_permissive_or_unknown_schema_keeps_the_index_beside_the_token(name, tool, index):
-    backend = _backend({tool: _PERMITS_INDEX[name]}, tokens={i: f"s1:{i}" for i in range(_ELEMENT_COUNT)})
-    assert _act(backend, tool, index).ok is True
-    args = backend._session.call_tool.call_args.args[1]
-    assert args["element_index"] == index and args["element_token"] == f"s1:{index}"
-
-
-@pytest.mark.parametrize("name", list(_PERMITS_INDEX))
-def test_permissive_or_unknown_schema_never_refuses_a_tokenless_index(name):
-    backend = _backend({"click": _PERMITS_INDEX[name]}, tokens={})
-    assert backend.click(element=0).ok is True
-    args = backend._session.call_tool.call_args.args[1]
-    assert args["element_index"] == 0 and "element_token" not in args
-
-
-@pytest.mark.parametrize("schema", [
-    _click_schema(properties={**_TOKEN_PROPS, "element_token": False}),
-    _click_schema(properties={**_TOKEN_PROPS, "element_token": False, "element_index": {"type": "integer"}},
-                  additionalProperties=False),
-], ids=["permissive", "strict-with-index"])
-def test_a_token_the_schema_rejects_is_not_attached_from_the_schema(schema):
-    """Declaring ``element_token`` is not proof it is accepted (boolean ``false``). The separate legacy
-    ``capabilities[]`` path is deliberately unchanged (see the capability-advertised test above)."""
-    backend = _backend({"click": schema}, tokens={5: "s1:5"})
-    assert backend.click(element=5).ok is True
-    args = backend._session.call_tool.call_args.args[1]
-    assert args["element_index"] == 5 and "element_token" not in args
-
-
-@pytest.mark.parametrize("name", list(_FORBIDS_INDEX))
-def test_without_a_validator_only_a_structural_prohibition_counts(monkeypatch, name):
-    """If jsonschema cannot evaluate the schema, `additionalProperties: false` / `element_index: false`
-    still classify as token-only; anything needing real evaluation stays legacy, never token-only."""
-    def unavailable(*args, **kwargs):
-        raise ImportError("jsonschema unavailable")
-    monkeypatch.setattr("jsonschema.validators.validator_for", unavailable)
-    structural = name in {"strict", "strict-with-unrelated-required", "boolean-false-index"}
-    backend = _backend({"click": _FORBIDS_INDEX[name]}, tokens={5: "s1:5"})
-    assert backend.click(element=5).ok is True
-    args = backend._session.call_tool.call_args.args[1]
-    if structural:
-        assert args["element_token"] == "s1:5" and "element_index" not in args
-    else:
-        assert args["element_index"] == 5  # needs real evaluation: unknown, so legacy behaviour
-
-
-@pytest.mark.parametrize("name", list(_PERMITS_INDEX))
-def test_without_a_validator_permissive_schemas_stay_legacy(monkeypatch, name):
-    monkeypatch.setattr("jsonschema.validators.validator_for", lambda *a, **k: (_ for _ in ()).throw(ImportError()))
-    backend = _backend({"click": _PERMITS_INDEX[name]}, tokens={5: "s1:5"})
-    assert backend.click(element=5).ok is True
-    args = backend._session.call_tool.call_args.args[1]
-    assert args["element_index"] == 5
-
-
-def test_classification_never_fetches_remote_schema_references(monkeypatch):
-    remote_reads: List[Any] = []
-    monkeypatch.setattr("urllib.request.urlopen", lambda *a, **k: remote_reads.append(a))
-    schema = _click_schema(properties={**_TOKEN_PROPS, "element_index": {"$ref": "https://invalid.example/i.json"}})
-    backend = _backend({"click": schema}, tokens={5: "s1:5"})
-    assert backend.click(element=5).ok is True  # unresolvable: unknown, legacy behaviour
-    args = backend._session.call_tool.call_args.args[1]
-    assert args["element_index"] == 5
-    assert remote_reads == []
-
-
-def test_tree_format_resolves_a_root_local_defs_ref_and_still_rejects_remote_refs(monkeypatch):
-    """Review finding 1 did not reproduce: a root-local $ref is resolved (documents correct behaviour),
-    while a remote $ref keeps failing closed without any network read."""
-    remote_reads: List[Any] = []
-    monkeypatch.setattr("urllib.request.urlopen", lambda *a, **k: remote_reads.append(a))
-    local = {"properties": {"tree_format": {"$ref": "#/$defs/treeFormat"}},
-             "$defs": {"treeFormat": {"enum": ["markdown", "elements", "both"]}}}
-    backend = _capture_backend(local)
-    assert backend._session.supports_input_value("get_window_state", "tree_format", "elements") is True
-    assert backend._session.supports_input_value("get_window_state", "tree_format", "bogus") is False
-    backend._active_pid, backend._active_window_id = 101, 202
-    assert backend._gws_args(structured=True)["tree_format"] == "elements"
-    remote = _capture_backend({"properties": {"tree_format": {"$ref": "https://invalid.example/f.json"}}})
-    assert remote._session.supports_input_value("get_window_state", "tree_format", "elements") is False
-    assert remote_reads == []
-
-
-# ---------------------------------------------------------------------------
-# Negotiate the ACTUAL payload values (real index, real snapshot token), never placeholders.
-# ---------------------------------------------------------------------------
-
-def _send(schema: Dict[str, Any], element: Any, tokens: Dict[int, str], tool: str = "click"):
-    backend = _backend({tool: schema}, tokens=tokens)
-    res = _act(backend, tool, element)
-    sent = backend._session.call_tool.call_args.args[1] if backend._session.call_tool.called else None
-    return res, sent
-
-
-_MIXED_MIN1 = {"type": "object",
-               "properties": {"element_token": {"type": "string"},
-                              "element_index": {"type": "integer", "minimum": 1}},
-               "additionalProperties": False}
-
-
-def test_a_valid_index_is_kept_on_a_mixed_schema_with_a_positive_minimum():
-    """Manager reproduction 1: index 1 satisfies `minimum: 1`; the schema is NOT token-only."""
-    res, sent = _send(_MIXED_MIN1, 1, {1: "tok_synthetic"})
-    assert res.ok is True
-    assert sent["element_index"] == 1 and sent["element_token"] == "tok_synthetic"
-
-
-def test_an_index_the_mixed_schema_rejects_is_replaced_by_its_valid_token_or_refused():
-    res, sent = _send(_MIXED_MIN1, 0, {0: "tok_root"})
-    assert res.ok is True and sent["element_token"] == "tok_root" and "element_index" not in sent
-    res, sent = _send(_MIXED_MIN1, 0, {})
-    assert res.ok is False and res.code == "stale_element" and sent is None
-
-
-_PATTERNED = {"type": "object",
-              "properties": {"element_token": {"type": "string", "pattern": "^tok_"}},
-              "additionalProperties": False}
-
-
-def test_a_valid_patterned_token_is_attached_and_the_forbidden_index_dropped():
-    """Manager reproduction 2: 'tok_synthetic' matches the pattern the old fixed probe 'token' failed."""
-    res, sent = _send(_PATTERNED, 1, {1: "tok_synthetic"})
-    assert res.ok is True
-    assert sent["element_token"] == "tok_synthetic" and "element_index" not in sent
-
-
-@pytest.mark.parametrize(("token_schema", "good", "bad"), [
-    ({"type": "string", "pattern": "^tok_"}, "tok_synthetic", "bad_synthetic"),
-    ({"type": "string", "minLength": 6}, "abcdef", "abc"),
-    ({"type": "string", "enum": ["alpha", "beta"]}, "beta", "gamma"),
-], ids=["pattern", "minLength", "enum"])
-def test_actual_token_value_decides_acceptance_on_a_strict_token_only_schema(token_schema, good, bad):
-    schema = {"type": "object", "properties": {"element_token": token_schema}, "additionalProperties": False}
-    res, sent = _send(schema, 3, {3: good})
-    assert res.ok is True and sent["element_token"] == good and "element_index" not in sent
-    # An invalid snapshot token fails closed: no forbidden index, no downgrade, driver never called.
-    res, sent = _send(schema, 3, {3: bad})
-    assert res.ok is False and res.code == "stale_element" and sent is None
-
-
-@pytest.mark.parametrize("tool", ["click", "set_value", "scroll", "double_click"])
-def test_patterned_token_schema_works_for_every_element_action(tool):
-    res, sent = _send(_PATTERNED, 4, {4: "tok_x"}, tool=tool)
-    assert res.ok is True and sent["element_token"] == "tok_x" and "element_index" not in sent
-
-
-def test_a_token_missing_for_the_actual_index_is_refused_even_when_other_tokens_exist():
-    res, sent = _send(_PATTERNED, 2, {1: "tok_synthetic"})
-    assert res.ok is False and res.code == "stale_element" and sent is None
-
-
-# Unadvertised tokens are not sent: permitting extra properties is not declaring token support.
-_NO_TOKEN_SUPPORT = {
-    "omitted-additionalProperties": {"type": "object", "properties": {"pid": {"type": "integer"},
-                                                                      "element_index": {"type": "integer"}}},
-    "additionalProperties-true": {"type": "object", "properties": {"element_index": {"type": "integer"}},
-                                  "additionalProperties": True},
-    "index-only-no-properties-list": {"type": "object"},
-}
-
-
-@pytest.mark.parametrize("name", list(_NO_TOKEN_SUPPORT))
-def test_a_schema_that_merely_permits_extras_does_not_get_an_unadvertised_token(name):
-    res, sent = _send(_NO_TOKEN_SUPPORT[name], 5, {5: "tok_synthetic"})
-    assert res.ok is True and sent["element_index"] == 5 and "element_token" not in sent
-
-
-@pytest.mark.parametrize("name", list(_NO_TOKEN_SUPPORT))
-def test_the_legacy_capability_still_attaches_the_token_beside_the_index(name):
-    backend = _backend({"click": _NO_TOKEN_SUPPORT[name]}, tokens={5: "tok_synthetic"})
-    backend._session._capabilities["click"] = {"accessibility.element_tokens"}
-    assert backend.click(element=5).ok is True
-    sent = backend._session.call_tool.call_args.args[1]
-    assert sent["element_index"] == 5 and sent["element_token"] == "tok_synthetic"
-
-
-def test_a_token_declared_only_inside_a_composed_branch_counts_as_declared():
-    schema = {"allOf": [{"properties": {"element_token": {"type": "string", "pattern": "^tok_"}}}]}
-    res, sent = _send(schema, 5, {5: "tok_synthetic"})
-    assert res.ok is True and sent["element_index"] == 5 and sent["element_token"] == "tok_synthetic"
-
-
-# patternProperties makes a property list non-exhaustive: never infer a prohibition from it.
-_PATTERN_PROPERTIES = {"type": "object", "properties": {"element_token": {"type": "string"}},
-                       "patternProperties": {"^element_": {}}, "additionalProperties": False}
-
-
-@pytest.mark.parametrize("validator", ["available", "missing"])
-def test_pattern_properties_do_not_make_the_index_forbidden(monkeypatch, validator):
-    if validator == "missing":
-        monkeypatch.setattr("jsonschema.validators.validator_for",
-                            lambda *a, **k: (_ for _ in ()).throw(ImportError("jsonschema unavailable")))
-    res, sent = _send(_PATTERN_PROPERTIES, 5, {5: "tok_synthetic"})
-    assert res.ok is True and sent["element_index"] == 5
-    res, sent = _send(_PATTERN_PROPERTIES, 5, {})
-    assert res.ok is True and sent["element_index"] == 5 and "element_token" not in sent
-
-
-@pytest.mark.parametrize("composition", [
-    {"allOf": [{"properties": {"element_index": {"type": "integer"}}}]},
-    {"anyOf": [{"properties": {"element_index": {"type": "integer"}}}, {"type": "object"}]},
-    {"if": {"required": ["pid"]}, "then": {"properties": {"element_index": {"type": "integer"}}}},
-], ids=["allOf", "anyOf", "if-then"])
-def test_without_a_validator_a_composed_schema_is_never_called_restrictive(monkeypatch, composition):
-    monkeypatch.setattr("jsonschema.validators.validator_for",
-                        lambda *a, **k: (_ for _ in ()).throw(ImportError("jsonschema unavailable")))
-    schema = {"type": "object", "properties": {"element_token": {"type": "string"}},
-              "additionalProperties": False, **composition}
-    res, sent = _send(schema, 5, {})
-    assert res.ok is True and sent["element_index"] == 5  # acceptance unknown -> legacy, not refused
-
-
-def test_without_a_validator_a_simple_strict_schema_is_still_token_only(monkeypatch):
-    monkeypatch.setattr("jsonschema.validators.validator_for",
-                        lambda *a, **k: (_ for _ in ()).throw(ImportError("jsonschema unavailable")))
-    res, sent = _send(_PATTERNED, 1, {1: "tok_synthetic"})
-    assert res.ok is True and sent["element_token"] == "tok_synthetic" and "element_index" not in sent
-    res, sent = _send(_PATTERNED, 1, {})
-    assert res.ok is False and res.code == "stale_element" and sent is None
-
-
-# ---------------------------------------------------------------------------
-# Negotiate inside the REAL outbound action payload, never an isolated one-property probe.
-# A verdict may only reject the index/token when the rejection is attributable to that
-# property itself; another field's error, or a constraint that needs other fields, is unknown.
-# ---------------------------------------------------------------------------
-
-_CTX_PROPS = {"pid": {"type": "integer"}, "window_id": {"type": "integer"},
-              "button": {"enum": ["left", "right", "middle"]}, "session": {"type": "string"},
-              "element_index": {"type": "integer"}, "element_token": {"type": "string"}}
-
-
-def _ctx_schema(**keywords: Any) -> Dict[str, Any]:
-    return {"type": "object", "properties": dict(_CTX_PROPS), "additionalProperties": False, **keywords}
-
-
-def test_manager_reproduction_dependent_required_keeps_the_valid_index():
-    """Manager reproduction (8d419ffb7): `dependentRequired: element_index -> pid`; the real args
-    {element_index: 1, pid: 123} are valid, an isolated {element_index: 1} probe is not."""
-    schema = {"type": "object", "properties": {"element_index": {"type": "integer"}, "pid": {"type": "integer"}},
-              "dependentRequired": {"element_index": ["pid"]}, "additionalProperties": False}
-    backend = _backend({"click": schema}, tokens={})
-    res = backend._action("click", {"element_index": 1, "pid": 123})
-    assert res.ok is True, res.message
-    sent = backend._session.call_tool.call_args.args[1]
-    assert sent["element_index"] == 1 and sent["pid"] == 123 and "element_token" not in sent
-
-
-@pytest.mark.parametrize("tool", ["click", "set_value", "scroll", "double_click"])
-def test_dependent_required_on_a_fully_declared_action_keeps_index_and_token(tool):
-    schema = _ctx_schema(dependentRequired={"element_index": ["pid"], "element_token": ["pid"]})
-    res, sent = _send(schema, 1, {1: "tok_synthetic"}, tool=tool)
-    assert res.ok is True
-    assert sent["element_index"] == 1 and sent["element_token"] == "tok_synthetic"
-
-
-def test_dependent_required_without_a_token_sends_the_legacy_index():
-    res, sent = _send(_ctx_schema(dependentRequired={"element_index": ["pid"]}), 0, {})
-    assert res.ok is True and sent["element_index"] == 0 and "element_token" not in sent
-
-
-_IF_PID = {"if": {"properties": {"pid": {"const": 111}}, "required": ["pid"]},
-           "then": {"properties": {"element_index": {"minimum": 0}}},
-           "else": {"properties": {"element_index": False}}}
-
-
-def test_a_conditional_that_depends_on_another_field_is_evaluated_in_the_real_payload():
-    schema = _ctx_schema(**_IF_PID)
-    res, sent = _send(schema, 4, {4: "tok_x"})  # real pid is 111 -> `then` applies -> index valid
-    assert res.ok is True and sent["element_index"] == 4 and sent["element_token"] == "tok_x"
-    res, sent = _send(schema, 4, {})
-    assert res.ok is True and sent["element_index"] == 4 and "element_token" not in sent
-
-
-def test_a_context_specific_rejection_attributable_to_the_index_still_counts():
-    """pid 999 selects the `else` branch where `element_index` is a false schema: the real payload's
-    index IS rejected, so it is dropped when a token exists and the action is refused otherwise."""
-    backend = _backend({"click": _ctx_schema(**_IF_PID)}, tokens={4: "tok_x"})
-    backend._active_pid = 999
-    assert backend.click(element=4).ok is True
-    sent = backend._session.call_tool.call_args.args[1]
-    assert sent["element_token"] == "tok_x" and "element_index" not in sent
-    backend = _backend({"click": _ctx_schema(**_IF_PID)}, tokens={})
-    backend._active_pid = 999
-    res = backend.click(element=4)
-    assert res.ok is False and res.code == "stale_element"
-    backend._session.call_tool.assert_not_called()
-
-
-def test_a_composed_constraint_that_cannot_be_attributed_is_unknown_not_a_refusal():
-    schema = _ctx_schema(anyOf=[{"properties": {"element_index": {"minimum": 100}}},
-                                {"properties": {"element_index": {"maximum": -1}}}])
-    res, sent = _send(schema, 5, {})
-    assert res.ok is True and sent["element_index"] == 5  # rejection not attributable -> legacy
-    res, sent = _send(schema, 5, {5: "tok_x"})
-    assert res.ok is True and sent["element_index"] == 5 and sent["element_token"] == "tok_x"
-
-
-def test_dependent_required_on_the_token_does_not_hide_a_valid_token():
-    schema = {"type": "object", "properties": {**_CTX_PROPS, "element_index": False},
-              "dependentRequired": {"element_token": ["pid"]}, "additionalProperties": False}
-    res, sent = _send(schema, 2, {2: "tok_synthetic"})
-    assert res.ok is True and sent["element_token"] == "tok_synthetic" and "element_index" not in sent
-
-
-@pytest.mark.parametrize("tool", ["click", "set_value"])
-def test_an_unrelated_invalid_field_is_not_proof_that_a_declared_index_is_forbidden(tool):
-    backend = _backend({tool: _ctx_schema()}, tokens={})
-    backend._active_pid = "not-an-integer"  # another field's error only
-    res = _act(backend, tool, 3)
-    assert res.ok is True
-    assert backend._session.call_tool.call_args.args[1]["element_index"] == 3
-
-
-def test_a_false_schema_on_an_unrelated_field_is_not_attributed_to_the_index():
-    """A `false` property schema yields a path-less error; it only counts against the index when
-    dropping the index removes it. Here `pid` is the rejected field, the index is fine."""
-    schema = _ctx_schema(properties={**_CTX_PROPS, "pid": False})
-    res, sent = _send(schema, 3, {})
-    assert res.ok is True and sent["element_index"] == 3
-    res, sent = _send(schema, 3, {3: "tok_x"})
-    assert res.ok is True and sent["element_index"] == 3 and sent["element_token"] == "tok_x"
-
-
-def test_an_unrelated_invalid_field_does_not_weaken_strict_token_only_safety():
-    strict = {"type": "object", "properties": {k: v for k, v in _CTX_PROPS.items() if k != "element_index"},
-              "additionalProperties": False}
-    backend = _backend({"click": strict}, tokens={3: "tok_x"})
-    backend._active_pid = "not-an-integer"
-    assert backend.click(element=3).ok is True
-    sent = backend._session.call_tool.call_args.args[1]
-    assert sent["element_token"] == "tok_x" and "element_index" not in sent
-    backend = _backend({"click": strict}, tokens={})
-    backend._active_pid = "not-an-integer"
-    res = backend.click(element=3)
-    assert res.ok is False and res.code == "stale_element"
-    backend._session.call_tool.assert_not_called()
+    assert reads == []
+
+
+def test_a_remote_reference_inside_the_capture_schema_is_unknown_so_the_baseline_request_is_kept(monkeypatch):
+    reads = _record_network(monkeypatch)
+    schema = _real("get_window_state")
+    schema["properties"]["session"] = {"$ref": "https://invalid.example/session.json"}
+    backend = _capture_backend(schema)
+    seen = _mcp_requests(backend, _ELEMENTS_RESPONSE)
+    backend.capture("ax", pid=101, window_id=202)
+    assert seen == [_LG] and reads == []

@@ -1390,159 +1390,77 @@ class _CuaDriverSession:
         properties = schema.get("properties") if isinstance(schema, dict) else None
         return isinstance(properties, dict) and property_name in properties
 
-    def supports_input_value(self, tool: str, property_name: str, value: Any) -> bool:
-        """Return whether the live schema accepts ``value`` for ``property_name``.
+    # Root vocabulary of the verified Cua 0.36 flat schemas (installed `describe`
+    # output); anything beyond it (composition, refs, conditionals, ...) is not adapted.
+    _FLAT_ROOT_KEYS = frozenset({"type", "properties", "additionalProperties", "required"})
+    # The only tools whose 0.36 contract was verified.  No other name is adapted.
+    _ELEMENT_TOOLS = frozenset({"click", "scroll", "set_value", "type_text"})
 
-        Property presence alone is not enough for enums such as
-        ``get_window_state.tree_format``.  Validation never fetches remote
-        ``$ref`` targets; a missing/invalid schema or an unavailable validator
-        fails closed so the legacy request shape is kept.
-        """
-        if not self.supports_input_property(tool, property_name):
+    def _flat_schema(self, tool: str) -> Optional[Dict[str, Any]]:
+        """The tool's schema iff it is exactly the verified flat object shape."""
+        schema = getattr(self, "_tool_schemas", {}).get(tool)
+        if not (
+            isinstance(schema, dict)
+            and schema.get("type") == "object"
+            and isinstance(schema.get("properties"), dict)
+            and schema.get("additionalProperties") is False
+            and set(schema) <= self._FLAT_ROOT_KEYS
+        ):
+            return None
+        required = schema.get("required", [])
+        if not (
+            isinstance(required, list)
+            and all(isinstance(name, str) for name in required)
+            and len(set(required)) == len(required)
+        ):
+            return None
+        return schema
+
+    def element_contract(self, tool: str) -> bool:
+        """Verified 0.36 element action: flat schema with NO ``element_index``
+        and an explicitly declared patterned-string ``element_token``."""
+        schema = self._flat_schema(tool) if tool in self._ELEMENT_TOOLS else None
+        if schema is None or "element_index" in schema["properties"]:
             return False
-        schema = self._tool_schemas[tool]
-        try:
-            from jsonschema.validators import validator_for
-            from referencing import Registry
+        token = schema["properties"].get("element_token")
+        return (
+            isinstance(token, dict)
+            and token.get("type") == "string"
+            and isinstance(token.get("pattern"), str)
+        )
 
-            validator = validator_for(schema)
-            validator.check_schema(schema)
-            return validator(schema, registry=Registry()).evolve(
-                schema=schema["properties"][property_name]
-            ).is_valid(value)
-        except Exception:
-            logger.debug(
-                "cua-driver input value schema validation failed for %s.%s",
-                tool, property_name, exc_info=True,
-            )
-            return False
+    def tree_format_contract(self) -> bool:
+        """Verified 0.36 ``get_window_state``: flat schema whose ``tree_format``
+        is a direct string enum that lists ``elements``."""
+        schema = self._flat_schema("get_window_state")
+        fmt = schema["properties"].get("tree_format") if schema else None
+        return (
+            isinstance(fmt, dict)
+            and fmt.get("type") == "string"
+            and isinstance(fmt.get("enum"), list)
+            and "elements" in fmt["enum"]
+        )
 
-    def input_value_rejected(
-        self, tool: str, payload: Dict[str, Any], property_name: str
-    ) -> bool:
-        """Whether the live schema rejects ``property_name`` in this ACTUAL payload.
+    def payload_verdict(self, tool: str, payload: Dict[str, Any]) -> Optional[bool]:
+        """Validate the COMPLETE outbound ``payload`` against the tool's whole
+        schema: ``True`` (VALID), ``False`` (INVALID) or ``None`` (UNKNOWN).
 
-        ``payload`` must be the complete outbound action arguments (real pid,
-        window, session, element index, snapshot token ...).  An isolated
-        one-property probe is unsound: it discards cross-field context
-        (``dependentRequired``, ``if``/``then``, ``dependentSchemas``), so a
-        valid action looks rejected, and a conditional can look accepted.
-
-        ``True`` only when the validator, run over the whole payload, reports
-        an error that is attributable to ``property_name`` itself:
-
-        * a property-level error at ``/<property_name>`` (``type``, ``minimum``,
-          ``pattern``, ``minLength``, ``enum``, a ``false`` property schema, an
-          ``additionalProperties`` sub-schema ...), or
-        * a root ``additionalProperties`` / ``unevaluatedProperties`` error that
-          names the property as unexpected.
-
-        Everything else is "not shown to be rejected" (``False``): errors on
-        other fields, ``required`` / ``dependentRequired`` / ``minProperties``
-        failures, and errors that only surface as an ``anyOf`` / ``oneOf`` /
-        ``not`` summary cannot be pinned on this property, so established
-        legacy behaviour is retained.  An overall invalid payload is therefore
-        not proof that the index is forbidden.  Root-local ``$ref`` is
-        resolved; remote references are never fetched.  If the validator is
-        unavailable or cannot evaluate the schema, only a structural
-        prohibition counts, and only when the property list is certainly
-        exhaustive: a ``false`` property schema, or ``additionalProperties:
-        false`` with the name undeclared and no ``patternProperties`` /
-        composition keyword at the root.
-        """
+        Import, construction, reference or evaluation errors are UNKNOWN, never
+        INVALID.  Nothing is fetched (empty ``Registry``).  Validity proves
+        admissibility only, not targeting semantics."""
         schema = getattr(self, "_tool_schemas", {}).get(tool)
         if not isinstance(schema, dict) or not schema:
-            return False
+            return None
         try:
             from jsonschema.validators import validator_for
             from referencing import Registry
 
             cls = validator_for(schema)
             cls.check_schema(schema)
-            validator = cls(schema, registry=Registry())
-            errors = list(validator.iter_errors(payload))
-            quoted = repr(property_name)
-            for error in errors:
-                path = tuple(error.absolute_path)
-                if path == (property_name,):
-                    return True
-                if (
-                    not path
-                    and error.validator in ("additionalProperties", "unevaluatedProperties")
-                    and quoted in error.message
-                ):
-                    return True
-            # jsonschema yields a ``false`` property schema's error WITHOUT a path
-            # (and with no validator keyword), so it cannot be located by path.
-            # Attribute it only if dropping this property removes such an error.
-            pathless = [e for e in errors if e.validator is None and not tuple(e.absolute_path)]
-            if pathless:
-                rest = {k: v for k, v in payload.items() if k != property_name}
-                remaining = [
-                    e for e in validator.iter_errors(rest)
-                    if e.validator is None and not tuple(e.absolute_path)
-                ]
-                return len(remaining) < len(pathless)
-            return False
+            return bool(cls(schema, registry=Registry()).is_valid(payload))
         except Exception:
-            logger.debug(
-                "cua-driver input schema evaluation failed for %s.%s",
-                tool, property_name, exc_info=True,
-            )
-        properties = schema.get("properties")
-        declared = isinstance(properties, dict) and property_name in properties
-        if declared and properties[property_name] is False:
-            return True
-        return (
-            schema.get("additionalProperties") is False
-            and not declared
-            and not any(key in schema for key in self._NON_EXHAUSTIVE_KEYWORDS)
-        )
-
-    # Root keywords that make a ``properties`` list non-exhaustive or conditional,
-    # so the structural fallback must not read ``additionalProperties: false`` as
-    # a prohibition (acceptance is then unknown without a real validator).
-    _NON_EXHAUSTIVE_KEYWORDS = (
-        "patternProperties", "allOf", "anyOf", "oneOf", "not", "if", "then", "else",
-        "$ref", "$dynamicRef", "dependentSchemas", "unevaluatedProperties",
-    )
-
-    def declares_input_property(self, tool: str, property_name: str) -> bool:
-        """Whether the live schema DECLARES ``property_name`` (not merely permits it).
-
-        Looks in ``properties`` at the root and through ``allOf`` / ``anyOf`` /
-        ``oneOf`` branches and root-local ``#/...`` ``$ref`` targets (bounded
-        depth, nothing fetched).  A ``False`` property schema is not a
-        declaration.  This is what separates "the driver supports tokens" from
-        "the schema merely tolerates extra properties", so unadvertised tokens
-        are never sent just because additional properties are allowed.
-        """
-        root = getattr(self, "_tool_schemas", {}).get(tool)
-
-        def walk(node: Any, depth: int) -> bool:
-            if depth > 8 or not isinstance(node, dict):
-                return False
-            properties = node.get("properties")
-            if (
-                isinstance(properties, dict)
-                and property_name in properties
-                and properties[property_name] is not False
-            ):
-                return True
-            for keyword in ("allOf", "anyOf", "oneOf"):
-                branches = node.get(keyword)
-                if isinstance(branches, list) and any(walk(b, depth + 1) for b in branches):
-                    return True
-            ref = node.get("$ref")
-            if isinstance(ref, str) and ref.startswith("#/"):
-                target: Any = root
-                for part in ref[2:].split("/"):
-                    key = part.replace("~1", "/").replace("~0", "~")
-                    target = target.get(key) if isinstance(target, dict) else None
-                return walk(target, depth + 1)
-            return False
-
-        return walk(root, 0)
+            logger.debug("cua-driver payload validation unknown for %s", tool, exc_info=True)
+            return None
 
     @property
     def capabilities_discovered(self) -> bool:
@@ -1701,6 +1619,15 @@ class _CuaDriverSession:
             fd, shot_file = _tempfile.mkstemp(prefix="cua_shot_", suffix=".png")
             os.close(fd)
             call_args["screenshot_out_file"] = shot_file
+        # The structured view was validated before the screenshot file existed.
+        # Revalidate the REAL request (session + file); unless VALID, drop only
+        # that added tree_format and keep the baseline screenshot-file transport.
+        if (
+            name == "get_window_state"
+            and "tree_format" in call_args
+            and self.payload_verdict(name, call_args) is not True
+        ):
+            del call_args["tree_format"]
 
         driver_command = resolve_cua_driver_cmd()
         if not driver_command:
@@ -2255,23 +2182,24 @@ class CuaDriverBackend(ComputerUseBackend):
     def _gws_args(self, *, structured: bool = False) -> Dict[str, Any]:
         """``get_window_state`` arguments for the active target.
 
-        Cua >= 0.35 defaults to compact Markdown without element tokens or
-        frames, so ax/som captures (``structured=True``) ask for the
-        structured ``elements`` view, but only when the live schema positively
-        accepts that value; every other driver keeps the legacy request.  The
-        same dict feeds the MCP call and the CLI re-fetch so both transports
-        negotiate the same view.
+        The installed-baseline request is ``{pid, window_id, session}``.  Cua
+        0.36 defaults to compact Markdown without element tokens or frames, so
+        ax/som captures (``structured=True``) ADD ``tree_format="elements"``,
+        but only for the verified flat contract (``tree_format_contract``) and
+        only when the COMPLETE payload validates; unknown, invalid, an
+        unavailable validator or any other schema keep the baseline request.
+        The same dict feeds the MCP call and the CLI re-fetch (which revalidates
+        with its real screenshot file); vision never passes ``structured``.
         """
         args: Dict[str, Any] = {
             "pid": self._active_pid,
             "window_id": self._active_window_id,
             "session": self._session_id,
         }
-        # ``is True``: only a real positive answer counts, never a truthy stand-in.
-        if structured and self._session.supports_input_value(
-            "get_window_state", "tree_format", "elements"
-        ) is True:
-            args["tree_format"] = "elements"
+        if structured and self._adapted("tree_format_contract"):
+            trial = {**args, "tree_format": "elements"}
+            if self._session.payload_verdict("get_window_state", trial) is True:
+                return trial
         return args
 
     def _load_windows(self) -> List[Dict[str, Any]]:
@@ -2917,12 +2845,13 @@ class CuaDriverBackend(ComputerUseBackend):
             "direction": direction,
             "amount": max(1, min(50, amount)),
         }
-        if element is not None:
-            # Fail closed: an element request must never fall through to a
+        if (element is not None and self._active_window_id is None
+                and self._adapted("element_contract", "scroll")):
+            # Verified-contract element scroll must never fall through to a
             # coordinate or bare-window scroll when its window is unknown.
-            if self._active_window_id is None:
-                return ActionResult(ok=False, action="scroll",
-                                    message="No active window_id for element scroll.")
+            return ActionResult(ok=False, action="scroll",
+                                message="No active window_id for element scroll.")
+        if element is not None and self._active_window_id is not None:
             args["element_index"] = element
             args["window_id"] = self._active_window_id
         elif x is not None and y is not None:
@@ -3394,114 +3323,58 @@ class CuaDriverBackend(ComputerUseBackend):
         return self._session.call_tool(name, payload, timeout=timeout)
 
     # ── Internal ───────────────────────────────────────────────────
-    def _input_rejected(self, tool: str, payload: Dict[str, Any], name: str) -> bool:
-        """``input_value_rejected`` as a strict bool; sessions without it (test
-        fakes) and non-bool answers (mocks) mean "not shown to be rejected"."""
-        probe = getattr(self._session, "input_value_rejected", None)
-        return probe(tool, payload, name) is True if callable(probe) else False
-
-    def _declares_input(self, tool: str, name: str) -> bool:
-        """``declares_input_property`` with a ``supports_input_property`` fallback
-        for sessions that lack it (test fakes, mocks answer only with real bools)."""
-        probe = getattr(self._session, "declares_input_property", None)
-        declared = probe(tool, name) if callable(probe) else None
-        if isinstance(declared, bool):
-            return declared
-        return self._session.supports_input_property(tool, name) is True
+    def _adapted(self, method: str, *args: Any) -> bool:
+        """A verified-contract query on the session as a strict bool; sessions
+        without it (test fakes) and non-bool answers (mocks) are "not adapted"."""
+        probe = getattr(self._session, method, None)
+        return callable(probe) and probe(*args) is True
 
     def _maybe_attach_element_token(
         self, tool: str, args: Dict[str, Any], *, inject_session: bool = True
     ) -> Optional[ActionResult]:
-        """Surface 6: when the wrapper is about to call a token-capable
-        tool with `element_index`, look up the matching `element_token`
-        from the last snapshot and attach it. cua-driver-rs's contract
-        for combined args is documented in trycua/cua#1961:
+        """Surface 6: element-token handling for an `element_index` action.
 
-          "element_token takes precedence over element_index when both
-           supplied. Returns an explicit 'stale' error if the snapshot
-           has been superseded."
+        Verified Cua 0.36 contract (``element_contract``): the schema is the flat
+        ``additionalProperties: false`` object with no ``element_index`` and a
+        declared ``element_token``.  The cached token for the exact integer index
+        replaces the index, but only if the COMPLETE outbound payload (all
+        ordinary fields plus the injected session) validates.  A missing, locally
+        invalid or unevaluable token is refused here with ``stale_element`` before
+        dispatch; the forbidden index is never sent and nothing falls through to
+        untargeted or coordinate input.  A stale verdict from the driver is the
+        driver's own response.  Validation proves admissibility only.
 
-        Support is established from the live input schema first (cua-driver
-        0.21+ stopped publishing per-tool ``capabilities[]`` while still
-        accepting ``element_token``) and then from the capability claim, so
-        drivers that advertise neither never see the property.
-
-        cua-driver 0.32+ publishes strict token-only schemas
-        (``additionalProperties: false``) that accept ``element_token`` and
-        forbid ``element_index``: the token is sent alone, and an index with no
-        token from the latest capture (stale, superseded or never captured) is
-        refused here with ``stale_element`` so it can never reach the driver,
-        be re-resolved to another element, or degrade into untargeted input.
-        Negotiation happens in the REAL outbound payload (all other action
-        fields, the session id and the actual index/token values), never in an
-        isolated one-property probe, and the index is dropped only on POSITIVE,
-        attributable evidence that the schema rejects it
-        (``input_value_rejected``): declaring ``element_token`` without listing
-        ``element_index`` is not enough, because an omitted property stays
-        allowed unless the schema forbids it, and an invalid payload because of
-        another field, or a constraint that cannot be pinned on the index, is
-        "not shown to be rejected". Permissive or unknown schemas keep the
-        legacy behaviour (index kept beside the token, a tokenless index sent
-        as-is). The token is attached only when the schema declares
-        ``element_token`` (a schema that merely tolerates extra properties is
-        not support, so unadvertised tokens are not sent) or the older
-        ``capabilities[]`` claim advertises it, exactly as before; a declared
-        token the schema rejects for its actual value (``pattern`` mismatch ...)
-        is not sent, and with a rejected index too the action is refused.
-        Index ``0`` (the AXWindow root) is a valid, falsy index.
-
-        Returns an ``ActionResult`` refusal to short-circuit the call, else
-        ``None``.
+        Everything else keeps the installed-baseline behaviour: the index stays
+        and, as before, a token is attached beside it only where the driver
+        advertises ``accessibility.element_tokens`` for the tool.
         """
-        if "element_index" not in args:
-            return None
-        idx = args["element_index"]
-        # bool is an int subclass but never a valid element index.
-        index = idx if type(idx) is int else None
-        token = self._snapshot_tokens.get(index) if index is not None else None
-
-        # 1. Is the ACTUAL snapshot token attachable? Only a driver that declares
-        #    ``element_token`` (or advertises the legacy capability) ever sees one;
-        #    a schema that merely tolerates extra properties is not support.  A
-        #    rejection of the real token that is attributable to it (pattern /
-        #    minLength / enum ...) means it is not sent.  Evaluated inside the real
-        #    outbound payload (``outbound``), as the driver will see it.
-        outbound = dict(args)
-        if inject_session:
-            outbound.setdefault("session", self._session_id)
-        attach = False
-        if token:
-            if not self._input_rejected(
-                tool, {**outbound, "element_token": token}, "element_token"
-            ) and self._declares_input(tool, "element_token"):
-                attach = True
-            elif self._session.supports_capability(
-                "accessibility.element_tokens", tool=tool
-            ):
-                attach = True
-        if attach:
-            outbound["element_token"] = token
-
-        # 2. Does the schema reject the ACTUAL index inside that same payload?
-        #    (Forbidden outright, or its value violates e.g. ``minimum``, or a
-        #    conditional on other fields rejects it.)  Not attributable = legacy.
-        index_rejected = self._input_rejected(tool, outbound, "element_index")
-
-        if attach:
-            args["element_token"] = token
-            if index_rejected:  # the token carries the targeting on its own
-                args.pop("element_index", None)
-        elif index_rejected:
-            # Known-bad index and no valid token: never send it and never degrade
-            # into untargeted or coordinate input.
+        idx = args.get("element_index")
+        if "element_index" in args and self._adapted("element_contract", tool):
+            # bool is an int subclass but never a valid element index.
+            token = self._snapshot_tokens.get(idx) if type(idx) is int else None
+            if isinstance(token, str) and token:
+                payload = {k: v for k, v in args.items() if k != "element_index"}
+                payload["element_token"] = token
+                if inject_session:
+                    payload.setdefault("session", self._session_id)
+                if self._session.payload_verdict(tool, payload) is True:
+                    del args["element_index"]
+                    args["element_token"] = token
+                    return None
             return ActionResult(
                 ok=False, action=tool, code="stale_element",
-                message=(
-                    f"element {idx!r} has no valid token from the latest capture "
-                    "and the driver schema does not accept it as an index — "
-                    "call capture first"
-                ),
+                message=f"element {idx!r} has no usable token from the latest capture — call capture first",
             )
+        if not isinstance(idx, int):
+            return None
+        token = self._snapshot_tokens.get(idx)
+        if not token:
+            return None
+        if not self._session.supports_capability(
+            "accessibility.element_tokens", tool=tool
+        ):
+            return None
+        args["element_token"] = token
         return None
 
     def _action(
@@ -3512,8 +3385,9 @@ class CuaDriverBackend(ComputerUseBackend):
         inject_session: bool = True,
     ) -> ActionResult:
         # Attach the snapshot's element_token whenever the call carries
-        # an element_index and the target tool's schema/capabilities accept
-        # it; a strict token-only schema without a token refuses locally.
+        # an element_index and the driver advertises the capability; a verified
+        # Cua 0.36 element action instead swaps the index for a validated token
+        # or is refused locally.
         refusal = self._maybe_attach_element_token(
             name, args, inject_session=inject_session
         )
