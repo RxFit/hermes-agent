@@ -53,6 +53,14 @@ jobs:
       OPENAI_API_KEY: ""
       NOUS_API_KEY: ""
     steps:
+      - name: Preserve Git blob bytes (core.autocrlf=false, ephemeral runner only)
+        run: |
+          set -euo pipefail
+          # Runner-local global config. Without this a Windows checkout may convert LF to CRLF
+          # and change the raw-byte SHA256 of tracked fixtures.
+          git config --global core.autocrlf false
+          echo "core.autocrlf: $(git config --global --get core.autocrlf)"
+
       - name: Checkout frozen source
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
@@ -183,8 +191,33 @@ jobs:
           "${py}" -I -X utf8 -c "import sys; print(sys.version); assert sys.version_info[:2] == (3, 13), sys.version_info"
           "${py}" -I -X utf8 -c "import pytest; print('pytest', pytest.__version__)"
           "${py}" -I -X utf8 -m ruff --version
-          # Informational: where the tested modules resolve from (should be the frozen checkout).
-          "${py}" -I -X utf8 -c "import importlib.util as u; s = u.find_spec('tools.computer_use.cua_backend'); print('cua_backend resolves to:', s.origin if s else None)"
+          # Enforced provenance: the isolated interpreter is the external venv python and the
+          # candidate backend module is loaded from this frozen checkout.
+          "${py}" -I -X utf8 - <<'PY'
+          import hashlib
+          import os
+          import sys
+
+          import tools.computer_use.cua_backend as backend
+
+
+          def real(path):
+              return os.path.normcase(os.path.realpath(path))
+
+
+          expected_python = os.environ["HERMES_PYTHON"]
+          expected_backend = os.path.join(os.getcwd(), "tools", "computer_use", "cua_backend.py")
+          print("sys.executable      :", sys.executable)
+          print("HERMES_PYTHON       :", expected_python)
+          print("cua_backend.__file__:", backend.__file__)
+          print("expected backend    :", expected_backend)
+          with open(backend.__file__, "rb") as fh:
+              print("cua_backend sha256  :", hashlib.sha256(fh.read()).hexdigest())
+          if real(sys.executable) != real(expected_python):
+              sys.exit("::error::sys.executable does not resolve to HERMES_PYTHON")
+          if real(backend.__file__) != real(expected_backend):
+              sys.exit("::error::cua_backend was not loaded from the frozen checkout")
+          PY
 
       - name: Canonical computer-use tests (scripts/run_tests.sh)
         id: tests
