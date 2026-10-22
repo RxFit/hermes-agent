@@ -26,7 +26,9 @@ concurrency:
 
 env:
   # Frozen repair commit under test and the installed base it must descend from.
-  FROZEN_SHA: fbf7469cadb84707be482739326151037b1290f2
+  # FROZEN_SHA is the accepted runtime repair plus one metadata-only contributor-mapping commit.
+  FROZEN_SHA: 2b647f6aa308cca467df807f82d497e5a847fcf3
+  ACCEPTED_RUNTIME_SHA: fbf7469cadb84707be482739326151037b1290f2
   BASE_SHA: efbfe0842fb99b93f37546cce406307c0f5eaec0
 
 jobs:
@@ -101,19 +103,37 @@ jobs:
             fail "controller workflow is present in the tested source tree"
           fi
 
-          # Scope of the frozen change vs the installed base: exactly these five paths.
+          # Contributor-mapping file: the ONLY path added on top of the accepted runtime commit.
+          meta_path="contributors/emails/ada-chat@relevanceai-email-automation.iam.gserviceaccount.com"
+
+          # Scope of the frozen change vs the installed base: exactly these six paths.
           actual="$(git diff --name-only "${BASE_SHA}" "${FROZEN_SHA}" | tr -d '\r' | LC_ALL=C sort)"
           expected="$(printf '%s\n' \
+            "${meta_path}" \
             tests/computer_use/test_cua_wsl_manifest_path.py \
             tests/tools/fixtures/cua_036_cli_schemas.json \
             tests/tools/test_computer_use.py \
             tests/tools/test_computer_use_cua_036_token_targeting.py \
             tools/computer_use/cua_backend.py | LC_ALL=C sort)"
           echo "changed paths vs base:"; echo "${actual}"
-          [ "${actual}" = "${expected}" ] || fail "frozen diff vs base is not the expected five paths"
+          [ "${actual}" = "${expected}" ] || fail "frozen diff vs base is not the expected six paths"
 
-          # Retained production added-line ceiling (non-test paths only): <= 180.
-          prod_added="$(git diff --numstat "${BASE_SHA}" "${FROZEN_SHA}" -- . ':!tests' | awk '{a += $1} END {print a + 0}')"
+          # The frozen source is exactly the accepted runtime commit plus the mapping file:
+          # one parent, that parent is the accepted runtime SHA, and the only path changed
+          # between them is the literal mapping file, whose first non-comment line is RxFit.
+          parents="$(git rev-list --parents -n 1 "${FROZEN_SHA}" | tr -d '\r')"
+          [ "${parents}" = "${FROZEN_SHA} ${ACCEPTED_RUNTIME_SHA}" ] \
+            || fail "frozen source parent(s) '${parents}' != accepted runtime ${ACCEPTED_RUNTIME_SHA}"
+          meta_changed="$(git diff --name-only "${ACCEPTED_RUNTIME_SHA}" "${FROZEN_SHA}" | tr -d '\r')"
+          [ "${meta_changed}" = "${meta_path}" ] \
+            || fail "paths changed on top of the accepted runtime are not exactly the mapping file: ${meta_changed}"
+          meta_author="$(git show "${FROZEN_SHA}:${meta_path}" | awk '!/^#/ {print; exit}')"
+          [ "${meta_author}" = "RxFit" ] || fail "mapping first non-comment line is '${meta_author}', not 'RxFit'"
+          echo "frozen source = accepted runtime ${ACCEPTED_RUNTIME_SHA} + mapping ${meta_path} (${meta_author})"
+
+          # Retained production added-line ceiling (non-test paths only): <= 180. Only the
+          # literal two-line, non-executable contributor mapping is excluded; no runtime file is.
+          prod_added="$(git diff --numstat "${BASE_SHA}" "${FROZEN_SHA}" -- . ':!tests' ":!${meta_path}" | awk '{a += $1} END {print a + 0}')"
           echo "production added lines vs base: ${prod_added} (ceiling 180)"
           [ "${prod_added}" -le 180 ] || fail "production added lines ${prod_added} exceed the 180 ceiling"
 
