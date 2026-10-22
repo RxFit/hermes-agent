@@ -26,7 +26,7 @@ concurrency:
 
 env:
   # Frozen repair commit under test and the installed base it must descend from.
-  FROZEN_SHA: 9ee5d3558bbb5a7f62ffefb76b745ddc594e215d
+  FROZEN_SHA: fbf7469cadb84707be482739326151037b1290f2
   BASE_SHA: efbfe0842fb99b93f37546cce406307c0f5eaec0
 
 jobs:
@@ -93,15 +93,28 @@ jobs:
             fail "controller workflow is present in the tested source tree"
           fi
 
-          # Scope of the frozen change vs the installed base: exactly these four paths.
+          # Scope of the frozen change vs the installed base: exactly these five paths.
           actual="$(git diff --name-only "${BASE_SHA}" "${FROZEN_SHA}" | tr -d '\r' | LC_ALL=C sort)"
           expected="$(printf '%s\n' \
             tests/computer_use/test_cua_wsl_manifest_path.py \
+            tests/tools/fixtures/cua_036_cli_schemas.json \
             tests/tools/test_computer_use.py \
             tests/tools/test_computer_use_cua_036_token_targeting.py \
             tools/computer_use/cua_backend.py | LC_ALL=C sort)"
           echo "changed paths vs base:"; echo "${actual}"
-          [ "${actual}" = "${expected}" ] || fail "frozen diff vs base is not the expected four paths"
+          [ "${actual}" = "${expected}" ] || fail "frozen diff vs base is not the expected five paths"
+
+          # Retained production added-line ceiling (non-test paths only): <= 180.
+          prod_added="$(git diff --numstat "${BASE_SHA}" "${FROZEN_SHA}" -- . ':!tests' | awk '{a += $1} END {print a + 0}')"
+          echo "production added lines vs base: ${prod_added} (ceiling 180)"
+          [ "${prod_added}" -le 180 ] || fail "production added lines ${prod_added} exceed the 180 ceiling"
+
+          # Raw-byte SHA256 of the protected CLI schema fixture (no JSON normalization).
+          fixture_sha="ab3bfd206564c4a4f89f06e65791ee970806afd51574e88aa08c467c24901de0"
+          fixture_py="$(command -v python3 || command -v python)" || fail "no python available for the fixture hash"
+          fixture_actual="$("${fixture_py}" -I -c 'import hashlib, sys; print(hashlib.sha256(open(sys.argv[1], "rb").read()).hexdigest())' tests/tools/fixtures/cua_036_cli_schemas.json | tr -d '\r')"
+          echo "cua_036_cli_schemas.json sha256: ${fixture_actual}"
+          [ "${fixture_actual}" = "${fixture_sha}" ] || fail "cua_036_cli_schemas.json sha256 ${fixture_actual} != ${fixture_sha}"
 
           dirty="$(git status --porcelain)"
           [ -z "${dirty}" ] || fail "checkout is not clean before any step ran: ${dirty}"
@@ -197,7 +210,36 @@ jobs:
           set -e
           echo "${rc}" > "${T271_TMP}/logs/tests.rc"
           echo "scripts/run_tests.sh exit code: ${rc}"
-          exit "${rc}"
+          [ "${rc}" = 0 ] || exit "${rc}"
+
+          # Exactly 19 per-file rows, and >= 333 passed in the focused token-targeting file.
+          # Platform totals may vary and skips stay visible in the rows; no all-platform total is asserted.
+          "${HERMES_PYTHON}" -I -X utf8 - "${T271_TMP}/logs/tests.log" <<'PY'
+          import re
+          import sys
+
+          row = re.compile(r"^\[\s*[\d.]+%\s*\|.*\|\s*✗\s*\d+\]\s+([✓✗])\s+(\S+)\s+\((.*)\)\s*$")
+          files = {}
+          with open(sys.argv[1], encoding="utf-8", errors="replace") as fh:
+              for line in fh:
+                  m = row.match(line.rstrip("\r\n"))
+                  if m:
+                      files[m.group(2).replace("\\", "/")] = (m.group(1), m.group(3))
+          print(f"per-file rows: {len(files)}")
+          if len(files) != 19:
+              sys.exit(f"::error::expected exactly 19 per-file test rows, found {len(files)}")
+          bad = [f for f, (status, _) in files.items() if status != "✓"]
+          if bad:
+              sys.exit(f"::error::failing per-file rows: {bad}")
+          focused = [v for f, v in files.items() if f.endswith("tests/tools/test_computer_use_cua_036_token_targeting.py")]
+          if len(focused) != 1:
+              sys.exit("::error::focused token-targeting file row not found exactly once")
+          m = re.search(r"(\d+)✓", focused[0][1])
+          passed = int(m.group(1)) if m else 0
+          print(f"token-targeting passed: {passed} (minimum 333)")
+          if passed < 333:
+              sys.exit(f"::error::token-targeting passed {passed} < 333")
+          PY
 
       - name: ruff check .
         id: ruff
