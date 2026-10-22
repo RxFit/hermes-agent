@@ -24,6 +24,7 @@ Stdlib + pytest only; no live cua-driver, no real GUI, no network.
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 from pathlib import Path
 from typing import Any, Callable, Dict
@@ -57,9 +58,19 @@ def _backend(schemas: Dict[str, Any] | None = None, tokens: Dict[int, str] | Non
     backend._session._capabilities = {name: ({_CAP} if name in capable else set())
                                       for name in backend._session._tool_schemas}
     backend._active_pid, backend._active_window_id = 111, 222
-    backend._snapshot_tokens = dict(tokens or {})
+    if tokens:
+        _snapshot(backend, [{"element_index": i, "element_token": t} for i, t in tokens.items()])
     backend._session.call_tool = MagicMock(return_value=dict(_OK))
     return backend
+
+
+def _snapshot(backend: CuaDriverBackend, rows: list) -> None:
+    """Populate the backend's token cache the way production does: a real structured capture."""
+    elements = [{"role": "AXButton", "label": f"row {row['element_index']}", **row} for row in rows]
+    backend._session.call_tool = MagicMock(return_value={
+        "data": "", "images": ["cG5n"], "image_mime_types": [], "isError": False,
+        "structuredContent": {"tree_format": "elements", "elements": elements}})
+    backend.capture("ax", pid=111, window_id=222)
 
 
 def _all_real() -> Dict[str, Any]:
@@ -121,6 +132,16 @@ def _broken_validator(monkeypatch: pytest.MonkeyPatch, when: Callable[[Any], boo
 # Fixture sanity: this is what "recognised" means.
 # ---------------------------------------------------------------------------
 
+# SHA-256 of the manager-verified source artifact (installed-cua-036-cli-schemas.json, LF, no final newline).
+_FIXTURE_SHA256 = "ab3bfd206564c4a4f89f06e65791ee970806afd51574e88aa08c467c24901de0"
+
+
+def test_the_fixture_is_the_verbatim_source_artifact():
+    raw = (_FIXTURES / "cua_036_cli_schemas.json").read_bytes()
+    # A Windows checkout with autocrlf may store CRLF; the blob (and the source) are LF.
+    assert hashlib.sha256(raw.replace(b"\r\n", b"\n")).hexdigest() == _FIXTURE_SHA256
+
+
 def test_the_verified_metadata_is_the_flat_contract_for_exactly_five_tools():
     assert _METADATA["version"] == "cua-driver 0.36.0"
     assert set(_METADATA["tools"]) == {"click", "scroll", "set_value", "type_text", "get_window_state"}
@@ -177,7 +198,8 @@ def test_recognised_action_without_a_valid_current_token_is_refused_before_dispa
 
 
 @pytest.mark.parametrize("tool", list(_ACTIONS))
-@pytest.mark.parametrize("element", [True, 11.0, "11", 1.5], ids=["bool", "float", "str", "fraction"])
+@pytest.mark.parametrize("element", [True, 11.0, "11", 1.5, [11], {"i": 11}],
+                         ids=["bool", "float", "str", "fraction", "list", "dict"])
 def test_recognised_action_never_aliases_a_bool_or_noninteger_to_a_cached_index(tool, element):
     backend = _backend(tokens={1: _tok(1), 11: _tok(11)})
     result = _ACTIONS[tool][0](backend, element)
@@ -633,6 +655,197 @@ def test_reconnect_clears_cached_schemas_with_the_capabilities():
     session._start_lifecycle_locked = lambda: None
     session._restart_session_locked()
     assert session._capabilities == {} and session._tool_schemas == {}
+
+
+# ---------------------------------------------------------------------------
+# A schema that is not valid JSON Schema is not recognised: installed-baseline behaviour.
+# (An unavailable/failing VALIDATOR on a valid recognised schema still refuses; see above.)
+# ---------------------------------------------------------------------------
+
+_MALFORMED = ["nested-property-is-an-integer", "type-is-an-integer", "enum-is-not-a-list",
+              "token-pattern-is-an-invalid-regex"]
+
+
+def _malformed(tool: str, name: str) -> Dict[str, Any]:
+    schema = _real(tool)
+    if name == "nested-property-is-an-integer":
+        schema["properties"]["pid"] = 123
+    elif name == "type-is-an-integer":
+        schema["properties"]["pid"] = {"type": 7}
+    elif name == "enum-is-not-a-list":
+        schema["properties"]["session"] = {"enum": "x"}
+    else:
+        schema["properties"]["element_token"]["pattern"] = "["
+    return schema
+
+
+@pytest.mark.parametrize("tool", list(_ACTIONS))
+@pytest.mark.parametrize("name", _MALFORMED)
+@pytest.mark.parametrize("capable", [False, True], ids=["no-capability", "capability"])
+def test_a_json_schema_invalid_action_schema_keeps_the_exact_baseline_request(tool, name, capable):
+    backend = _backend({tool: _malformed(tool, name)}, tokens={11: _tok(11)}, capable=(tool,) if capable else ())
+    assert _ACTIONS[tool][0](backend, 11).ok is True
+    expected = {**_legacy(tool, 11), **({"element_token": _tok(11)} if capable else {})}
+    assert _sent(backend) == expected
+
+
+@pytest.mark.parametrize("name", _MALFORMED[:3])
+def test_a_json_schema_invalid_capture_schema_keeps_the_baseline_request(name):
+    backend = _capture_backend(_malformed("get_window_state", name))
+    seen = _mcp_requests(backend, _ELEMENTS_RESPONSE)
+    backend.capture("ax", pid=101, window_id=202)
+    assert seen == [_LG]
+
+
+# ---------------------------------------------------------------------------
+# Eligibility needs the LITERAL observed token pattern, not any pattern that validates.
+# ---------------------------------------------------------------------------
+
+_OBSERVED_PATTERN = "^s[0-9a-f]{8}:[0-9]+$"
+_OTHER_PATTERNS = {
+    "match-anything": (".*", "garbage"),
+    "uppercase-expanded": ("^s[0-9a-fA-F]{8}:[0-9]+$", _tok(11)),
+    "digit-class-spelled-differently": (r"^s[0-9a-f]{8}:\d+$", _tok(11)),
+    "no-end-anchor": ("^s[0-9a-f]{8}:[0-9]+", _tok(11)),
+    "no-start-anchor": ("s[0-9a-f]{8}:[0-9]+$", _tok(11)),
+    "longer-snapshot-id": ("^s[0-9a-f]{16}:[0-9]+$", "s0000002a0000002a:11"),
+    "invalid-regex": ("[", _tok(11)),
+}
+
+
+def test_the_observed_pattern_literal_is_what_the_fixture_publishes():
+    for tool in _ACTIONS:
+        assert _real(tool)["properties"]["element_token"]["pattern"] == _OBSERVED_PATTERN
+
+
+@pytest.mark.parametrize("tool", list(_ACTIONS))
+@pytest.mark.parametrize("name", list(_OTHER_PATTERNS))
+@pytest.mark.parametrize("capable", [False, True], ids=["no-capability", "capability"])
+def test_a_token_pattern_other_than_the_observed_one_keeps_the_exact_baseline_request(tool, name, capable):
+    pattern, token = _OTHER_PATTERNS[name]
+    schema = _real(tool)
+    schema["properties"]["element_token"]["pattern"] = pattern
+    backend = _backend({tool: schema}, tokens={11: token}, capable=(tool,) if capable else ())
+    assert _ACTIONS[tool][0](backend, 11).ok is True
+    assert _sent(backend) == {**_legacy(tool, 11), **({"element_token": token} if capable else {})}
+
+
+# ---------------------------------------------------------------------------
+# Snapshot safety on the recognised path: only a row whose captured index is an exact int counts.
+# The (pre-existing) parser also accepts a bool index; True aliases the dict key 1 and False aliases 0.
+# ---------------------------------------------------------------------------
+
+def _after_capture(rows: list, schemas: Dict[str, Any] | None = None) -> CuaDriverBackend:
+    backend = _backend(schemas)
+    _snapshot(backend, rows)
+    backend._session.call_tool = MagicMock(return_value=dict(_OK))
+    return backend
+
+
+_ALIASED_SNAPSHOTS = {
+    "bool-true-row-only": ([{"element_index": True, "element_token": _tok(1)}], 1),
+    "bool-false-row-only": ([{"element_index": False, "element_token": _tok(0)}], 0),
+    "int-row-then-bool-alias": ([{"element_index": 1, "element_token": _tok(1)},
+                                 {"element_index": True, "element_token": "s0000002a:101"}], 1),
+    "bool-alias-then-int-row": ([{"element_index": True, "element_token": "s0000002a:101"},
+                                 {"element_index": 1, "element_token": _tok(1)}], 1),
+}
+
+
+@pytest.mark.parametrize("tool", list(_ACTIONS))
+@pytest.mark.parametrize("name", list(_ALIASED_SNAPSHOTS))
+def test_a_bool_row_never_supplies_a_token_for_an_integer_action(tool, name):
+    rows, index = _ALIASED_SNAPSHOTS[name]
+    backend = _after_capture(rows)
+    result = _ACTIONS[tool][0](backend, index)
+    assert result.ok is False and result.code == "stale_element" and "capture" in result.message
+    backend._session.call_tool.assert_not_called()
+
+
+@pytest.mark.parametrize("tool", list(_ACTIONS))
+@pytest.mark.parametrize("index", [0, 1, 7])
+def test_an_exact_int_row_still_supplies_its_own_token_beside_unrelated_rows(tool, index):
+    backend = _after_capture([{"element_index": index, "element_token": _tok(index)},
+                              {"element_index": 40, "element_token": _tok(40)}])
+    assert _ACTIONS[tool][0](backend, index).ok is True
+    assert _sent(backend) == _tokenised(tool, index)
+
+
+def test_a_bool_row_does_not_disturb_a_different_exact_int_row():
+    backend = _after_capture([{"element_index": True, "element_token": "s0000002a:101"},
+                              {"element_index": 5, "element_token": _tok(5)}])
+    assert backend.click(element=5).ok is True
+    assert _sent(backend) == _tokenised("click", 5)
+
+
+def test_an_unrecognised_schema_keeps_the_historical_bool_cache_behaviour():
+    """Baseline behaviour outside the verified contract, documented but NOT claimed repaired."""
+    backend = _backend({}, capable=("click",))
+    backend._session._capabilities = {"click": {_CAP}}
+    _snapshot(backend, [{"element_index": True, "element_token": _tok(1)}])
+    backend._session.call_tool = MagicMock(return_value=dict(_OK))
+    assert backend.click(element=1).ok is True
+    assert _sent(backend) == {**_legacy("click", 1), "element_token": _tok(1)}
+
+
+def test_a_recognised_action_only_trusts_tokens_from_a_recognised_structured_capture():
+    schemas = _all_real()
+    del schemas["get_window_state"]  # the capture request stays the baseline one
+    backend = _after_capture([{"element_index": 11, "element_token": _tok(11)}], schemas)
+    assert backend._snapshot_tokens == {11: _tok(11)}  # the baseline cache is untouched
+    result = backend.click(element=11)
+    assert result.ok is False and result.code == "stale_element"
+    backend._session.call_tool.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Structured title fallback exists only for the validated structured request.
+# ---------------------------------------------------------------------------
+
+_STRUCTURED_TITLE_RESPONSE = {
+    "data": "", "images": ["cG5n"], "image_mime_types": [], "isError": False,
+    "structuredContent": {"window_title": "New title", "elements": [_WINDOW]}}
+
+
+@pytest.mark.parametrize("name", ["allOf-wrapper", "additionalProperties-true", "tree-format-empty-schema",
+                                  "boolean-true", "tree-format-no-elements", "extra-root-title"])
+def test_an_unrecognised_capture_schema_keeps_the_baseline_empty_title(name):
+    backend = _capture_backend(_INELIGIBLE_CAPTURE[name])
+    seen = _mcp_requests(backend, _STRUCTURED_TITLE_RESPONSE)
+    cap = backend.capture("ax", pid=101, window_id=202)
+    assert seen == [_LG] and cap.window_title == ""
+    assert backend._snapshot_tokens == {0: "s1234abcd:0"}  # baseline cache handling is untouched
+
+
+def test_an_undiscovered_capture_schema_keeps_the_baseline_empty_title():
+    backend = _backend({})
+    seen = _mcp_requests(backend, _STRUCTURED_TITLE_RESPONSE)
+    assert backend.capture("ax", pid=101, window_id=202).window_title == "" and seen == [_LG]
+
+
+@pytest.mark.parametrize("breakage", ["unavailable", "unknown"])
+def test_an_unvalidated_structured_request_keeps_the_baseline_empty_title(monkeypatch, breakage):
+    (_no_validator if breakage == "unavailable" else _broken_validator)(monkeypatch)
+    backend = _capture_backend()
+    seen = _mcp_requests(backend, _STRUCTURED_TITLE_RESPONSE)
+    assert backend.capture("ax", pid=101, window_id=202).window_title == "" and seen == [_LG]
+
+
+def test_an_invalid_structured_request_keeps_the_baseline_empty_title():
+    schema = _real("get_window_state")
+    schema["required"] = ["pid", "window_id", "undeclared_but_required"]
+    backend = _capture_backend(schema)
+    seen = _mcp_requests(backend, _STRUCTURED_TITLE_RESPONSE)
+    assert backend.capture("ax", pid=101, window_id=202).window_title == "" and seen == [_LG]
+
+
+def test_the_validated_structured_request_keeps_the_title_fallback():
+    backend = _capture_backend()
+    seen = _mcp_requests(backend, _STRUCTURED_TITLE_RESPONSE)
+    assert backend.capture("ax", pid=101, window_id=202).window_title == "New title" and seen == [_C]
+    no_title = {**_STRUCTURED_TITLE_RESPONSE, "structuredContent": {"elements": [_WINDOW]}}
+    seen = _mcp_requests(backend, no_title)
+    assert backend.capture("som", pid=101, window_id=202).window_title == "Fixture" and seen == [_C]
 
 
 # ---------------------------------------------------------------------------

@@ -1390,10 +1390,9 @@ class _CuaDriverSession:
         properties = schema.get("properties") if isinstance(schema, dict) else None
         return isinstance(properties, dict) and property_name in properties
 
-    # Root vocabulary of the verified Cua 0.36 flat schemas (installed `describe`
-    # output); anything beyond it (composition, refs, conditionals, ...) is not adapted.
+    # Verified Cua 0.36 vocabulary only: root keys of the flat schemas and the tools
+    # observed with them.  Composition, refs, conditionals and other names are not adapted.
     _FLAT_ROOT_KEYS = frozenset({"type", "properties", "additionalProperties", "required"})
-    # The only tools whose 0.36 contract was verified.  No other name is adapted.
     _ELEMENT_TOOLS = frozenset({"click", "scroll", "set_value", "type_text"})
 
     def _flat_schema(self, tool: str) -> Optional[Dict[str, Any]]:
@@ -1407,18 +1406,24 @@ class _CuaDriverSession:
             and set(schema) <= self._FLAT_ROOT_KEYS
         ):
             return None
-        required = schema.get("required", [])
-        if not (
-            isinstance(required, list)
-            and all(isinstance(name, str) for name in required)
-            and len(set(required)) == len(required)
-        ):
-            return None
+        try:
+            from jsonschema.exceptions import SchemaError
+            from jsonschema.validators import validator_for
+        except Exception:
+            return schema  # no validator: stay recognised; payload_verdict is then UNKNOWN
+        try:
+            validator_for(schema).check_schema(schema)
+        except SchemaError:
+            return None  # determinably not valid JSON Schema: not the verified contract
+        except Exception:
+            pass  # validator failing is not malformedness: payload_verdict is then UNKNOWN
         return schema
 
+    # The exact element_token pattern observed on Cua 0.36 (no other is adapted).
+    _TOKEN_PATTERN = "^s[0-9a-f]{8}:[0-9]+$"
+
     def element_contract(self, tool: str) -> bool:
-        """Verified 0.36 element action: flat schema with NO ``element_index``
-        and an explicitly declared patterned-string ``element_token``."""
+        """Verified 0.36 element action: flat, no ``element_index``, literal token pattern."""
         schema = self._flat_schema(tool) if tool in self._ELEMENT_TOOLS else None
         if schema is None or "element_index" in schema["properties"]:
             return False
@@ -1426,12 +1431,11 @@ class _CuaDriverSession:
         return (
             isinstance(token, dict)
             and token.get("type") == "string"
-            and isinstance(token.get("pattern"), str)
+            and token.get("pattern") == self._TOKEN_PATTERN
         )
 
     def tree_format_contract(self) -> bool:
-        """Verified 0.36 ``get_window_state``: flat schema whose ``tree_format``
-        is a direct string enum that lists ``elements``."""
+        """Verified 0.36 ``get_window_state``: flat, ``tree_format`` a string enum with ``elements``."""
         schema = self._flat_schema("get_window_state")
         fmt = schema["properties"].get("tree_format") if schema else None
         return (
@@ -1442,12 +1446,8 @@ class _CuaDriverSession:
         )
 
     def payload_verdict(self, tool: str, payload: Dict[str, Any]) -> Optional[bool]:
-        """Validate the COMPLETE outbound ``payload`` against the tool's whole
-        schema: ``True`` (VALID), ``False`` (INVALID) or ``None`` (UNKNOWN).
-
-        Import, construction, reference or evaluation errors are UNKNOWN, never
-        INVALID.  Nothing is fetched (empty ``Registry``).  Validity proves
-        admissibility only, not targeting semantics."""
+        """COMPLETE ``payload`` vs the whole schema: True (VALID), False (INVALID), None (UNKNOWN:
+        import/construction/reference/evaluation error).  No remote refs; admissibility only."""
         schema = getattr(self, "_tool_schemas", {}).get(tool)
         if not isinstance(schema, dict) or not schema:
             return None
@@ -2015,6 +2015,8 @@ class CuaDriverBackend(ComputerUseBackend):
         # element. Cleared whenever a fresh capture overwrites the
         # snapshot context.
         self._snapshot_tokens: Dict[int, str] = {}
+        # Exact-int rows of the last validated structured capture (see capture()).
+        self._exact_tokens: Dict[int, str] = {}
         # Per-instance cua-driver session id. cua-driver's MCP server
         # instructions ask every consumer to declare a stable session
         # at the start of a run (start_session) and tear it down at
@@ -2180,17 +2182,9 @@ class CuaDriverBackend(ComputerUseBackend):
         return out
 
     def _gws_args(self, *, structured: bool = False) -> Dict[str, Any]:
-        """``get_window_state`` arguments for the active target.
-
-        The installed-baseline request is ``{pid, window_id, session}``.  Cua
-        0.36 defaults to compact Markdown without element tokens or frames, so
-        ax/som captures (``structured=True``) ADD ``tree_format="elements"``,
-        but only for the verified flat contract (``tree_format_contract``) and
-        only when the COMPLETE payload validates; unknown, invalid, an
-        unavailable validator or any other schema keep the baseline request.
-        The same dict feeds the MCP call and the CLI re-fetch (which revalidates
-        with its real screenshot file); vision never passes ``structured``.
-        """
+        """Baseline ``{pid, window_id, session}``; ax/som (``structured``) ADD
+        ``tree_format="elements"`` only for the verified contract and a VALID complete
+        payload.  Shared by MCP and the CLI re-fetch (which revalidates with its file)."""
         args: Dict[str, Any] = {
             "pid": self._active_pid,
             "window_id": self._active_window_id,
@@ -2599,19 +2593,28 @@ class CuaDriverBackend(ComputerUseBackend):
                 for e in elements
                 if e.element_token
             }
+            # Verified-contract actions trust only exact-int rows of a validated structured
+            # request (the parser accepts bool indices, which alias int dict keys: an index
+            # claimed by a non-int row is ambiguous and dropped).  Rebuilt on every capture.
+            ambiguous = {e.index for e in elements if e.element_token and type(e.index) is not int}
+            self._exact_tokens = {
+                e.index: e.element_token for e in elements
+                if "tree_format" in gws_args and e.element_token
+                and type(e.index) is int and e.index not in ambiguous
+            }
 
             # Image may arrive as an MCP image part or inside
             # structuredContent (screenshot_png_b64) depending on the driver
             # build — _image_from_tool_result handles both.
             png_b64, image_mime_type = _image_from_tool_result(gws_out)
 
-            # Extract window title from the AX tree first AXWindow line. An
-            # elements-only response has no Markdown tree, so fall back to the
-            # driver's structured window_title, then the AXWindow element label.
+            # Extract window title from the AX tree first AXWindow line. Only when
+            # this capture requested the validated structured view (no Markdown
+            # tree) fall back to the driver's window_title, then the AXWindow label.
             wt = re.search(r'AXWindow\s+"([^"]+)"', tree)
             if wt:
                 window_title = wt.group(1)
-            else:
+            elif "tree_format" in gws_args:
                 sc_title = (gws_out.get("structuredContent") or {}).get("window_title")
                 window_title = (
                     sc_title if isinstance(sc_title, str) and sc_title
@@ -3324,8 +3327,7 @@ class CuaDriverBackend(ComputerUseBackend):
 
     # ── Internal ───────────────────────────────────────────────────
     def _adapted(self, method: str, *args: Any) -> bool:
-        """A verified-contract query on the session as a strict bool; sessions
-        without it (test fakes) and non-bool answers (mocks) are "not adapted"."""
+        """Session contract query as a strict bool (fakes/mocks: "not adapted")."""
         probe = getattr(self._session, method, None)
         return callable(probe) and probe(*args) is True
 
@@ -3334,24 +3336,20 @@ class CuaDriverBackend(ComputerUseBackend):
     ) -> Optional[ActionResult]:
         """Surface 6: element-token handling for an `element_index` action.
 
-        Verified Cua 0.36 contract (``element_contract``): the schema is the flat
-        ``additionalProperties: false`` object with no ``element_index`` and a
-        declared ``element_token``.  The cached token for the exact integer index
-        replaces the index, but only if the COMPLETE outbound payload (all
-        ordinary fields plus the injected session) validates.  A missing, locally
-        invalid or unevaluable token is refused here with ``stale_element`` before
-        dispatch; the forbidden index is never sent and nothing falls through to
-        untargeted or coordinate input.  A stale verdict from the driver is the
-        driver's own response.  Validation proves admissibility only.
-
-        Everything else keeps the installed-baseline behaviour: the index stays
-        and, as before, a token is attached beside it only where the driver
-        advertises ``accessibility.element_tokens`` for the tool.
-        """
+        Verified Cua 0.36 contract (``element_contract``): the exact-int row's token from the
+        current validated capture replaces the index only if the COMPLETE outbound payload
+        (ordinary fields + session) validates; otherwise a local ``stale_element`` refusal
+        before dispatch (never the forbidden index, never untargeted/coordinate input).  A
+        driver stale verdict is the driver's own response.  Everything else keeps the
+        installed-baseline behaviour (index stays; token beside it only with the advertised
+        ``accessibility.element_tokens`` capability)."""
         idx = args.get("element_index")
         if "element_index" in args and self._adapted("element_contract", tool):
-            # bool is an int subclass but never a valid element index.
-            token = self._snapshot_tokens.get(idx) if type(idx) is int else None
+            token = None
+            if type(idx) is int:  # bool is an int subclass but never a valid index
+                token = self._exact_tokens.get(idx)
+                if token != self._snapshot_tokens.get(idx):
+                    token = None  # the cache was reset or replaced since that capture
             if isinstance(token, str) and token:
                 payload = {k: v for k, v in args.items() if k != "element_index"}
                 payload["element_token"] = token
