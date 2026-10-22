@@ -1390,6 +1390,78 @@ class _CuaDriverSession:
         properties = schema.get("properties") if isinstance(schema, dict) else None
         return isinstance(properties, dict) and property_name in properties
 
+    # Verified Cua 0.36 vocabulary only: root keys of the flat schemas and the tools
+    # observed with them.  Composition, refs, conditionals and other names are not adapted.
+    _FLAT_ROOT_KEYS = frozenset({"type", "properties", "additionalProperties", "required"})
+    _ELEMENT_TOOLS = frozenset({"click", "scroll", "set_value", "type_text"})
+
+    def _flat_schema(self, tool: str) -> Optional[Dict[str, Any]]:
+        """The tool's schema iff it is exactly the verified flat object shape."""
+        schema = getattr(self, "_tool_schemas", {}).get(tool)
+        if not (
+            isinstance(schema, dict)
+            and schema.get("type") == "object"
+            and isinstance(schema.get("properties"), dict)
+            and schema.get("additionalProperties") is False
+            and set(schema) <= self._FLAT_ROOT_KEYS
+        ):
+            return None
+        try:
+            from jsonschema.exceptions import SchemaError
+            from jsonschema.validators import validator_for
+        except Exception:
+            return schema  # no validator: stay recognised; payload_verdict is then UNKNOWN
+        try:
+            validator_for(schema).check_schema(schema)
+        except SchemaError:
+            return None  # determinably not valid JSON Schema: not the verified contract
+        except Exception:
+            pass  # validator failing is not malformedness: payload_verdict is then UNKNOWN
+        return schema
+
+    # The exact element_token pattern observed on Cua 0.36 (no other is adapted).
+    _TOKEN_PATTERN = "^s[0-9a-f]{8}:[0-9]+$"
+
+    def element_contract(self, tool: str) -> bool:
+        """Verified 0.36 element action: flat, no ``element_index``, literal token pattern."""
+        schema = self._flat_schema(tool) if tool in self._ELEMENT_TOOLS else None
+        if schema is None or "element_index" in schema["properties"]:
+            return False
+        token = schema["properties"].get("element_token")
+        return (
+            isinstance(token, dict)
+            and token.get("type") == "string"
+            and token.get("pattern") == self._TOKEN_PATTERN
+        )
+
+    def tree_format_contract(self) -> bool:
+        """Verified 0.36 ``get_window_state``: flat, ``tree_format`` a string enum with ``elements``."""
+        schema = self._flat_schema("get_window_state")
+        fmt = schema["properties"].get("tree_format") if schema else None
+        return (
+            isinstance(fmt, dict)
+            and fmt.get("type") == "string"
+            and isinstance(fmt.get("enum"), list)
+            and "elements" in fmt["enum"]
+        )
+
+    def payload_verdict(self, tool: str, payload: Dict[str, Any]) -> Optional[bool]:
+        """COMPLETE ``payload`` vs the whole schema: True (VALID), False (INVALID), None (UNKNOWN:
+        import/construction/reference/evaluation error).  No remote refs; admissibility only."""
+        schema = getattr(self, "_tool_schemas", {}).get(tool)
+        if not isinstance(schema, dict) or not schema:
+            return None
+        try:
+            from jsonschema.validators import validator_for
+            from referencing import Registry
+
+            cls = validator_for(schema)
+            cls.check_schema(schema)
+            return bool(cls(schema, registry=Registry()).is_valid(payload))
+        except Exception:
+            logger.debug("cua-driver payload validation unknown for %s", tool, exc_info=True)
+            return None
+
     @property
     def capabilities_discovered(self) -> bool:
         """True once ``tools/list`` populated the per-tool map. When False,
@@ -1511,6 +1583,7 @@ class _CuaDriverSession:
         self._started = False
         # Clear stale capability state; the next start populates from scratch.
         self._capabilities = {}
+        self._tool_schemas = {}
         self._capability_version = ""
         self._start_lifecycle_locked()
         self._started = True
@@ -1546,6 +1619,16 @@ class _CuaDriverSession:
             fd, shot_file = _tempfile.mkstemp(prefix="cua_shot_", suffix=".png")
             os.close(fd)
             call_args["screenshot_out_file"] = shot_file
+        # The structured view was validated before the screenshot file existed: revalidate the
+        # REAL request (session + file); unless VALID drop only that added tree_format.
+        dropped_tree_format = False
+        if (
+            name == "get_window_state"
+            and "tree_format" in call_args
+            and self.payload_verdict(name, call_args) is not True
+        ):
+            del call_args["tree_format"]
+            dropped_tree_format = True
 
         driver_command = resolve_cua_driver_cmd()
         if not driver_command:
@@ -1641,6 +1724,8 @@ class _CuaDriverSession:
                 "images": images,
                 "structuredContent": structured,
                 "isError": is_error,
+                # Our own marker, never driver-controlled: the sent request lacked the asked-for view.
+                **({"cli_dropped_tree_format": True} if dropped_tree_format else {}),
             }
         finally:
             if shot_file and os.path.exists(shot_file):
@@ -1933,6 +2018,8 @@ class CuaDriverBackend(ComputerUseBackend):
         # element. Cleared whenever a fresh capture overwrites the
         # snapshot context.
         self._snapshot_tokens: Dict[int, str] = {}
+        # Exact-int rows of the last validated structured capture (see capture()).
+        self._exact_tokens: Dict[int, str] = {}
         # Per-instance cua-driver session id. cua-driver's MCP server
         # instructions ask every consumer to declare a stable session
         # at the start of a run (start_session) and tear it down at
@@ -2096,6 +2183,21 @@ class CuaDriverBackend(ComputerUseBackend):
                 + (f": {message}" if isinstance(message, str) and message else "")
             )
         return out
+
+    def _gws_args(self, *, structured: bool = False) -> Dict[str, Any]:
+        """Baseline ``{pid, window_id, session}``; ax/som (``structured``) ADD
+        ``tree_format="elements"`` only for the verified contract and a VALID complete
+        payload.  Shared by MCP and the CLI re-fetch (which revalidates with its file)."""
+        args: Dict[str, Any] = {
+            "pid": self._active_pid,
+            "window_id": self._active_window_id,
+            "session": self._session_id,
+        }
+        if structured and self._adapted("tree_format_contract"):
+            trial = {**args, "tree_format": "elements"}
+            if self._session.payload_verdict("get_window_state", trial) is True:
+                return trial
+        return args
 
     def _load_windows(self) -> List[Dict[str, Any]]:
         """Load normalized visible windows, with the shared CLI recovery path.
@@ -2390,14 +2492,7 @@ class CuaDriverBackend(ComputerUseBackend):
                     sc_out = None
 
             if sc_out is None:
-                gws_out = self._call_capture_tool(
-                    "get_window_state",
-                    {
-                        "pid": self._active_pid,
-                        "window_id": self._active_window_id,
-                        "session": self._session_id,
-                    },
-                )
+                gws_out = self._call_capture_tool("get_window_state", self._gws_args())
                 png_b64, image_mime_type = _image_from_tool_result(gws_out)
                 # Still grab the window title — it's cheap and useful in the
                 # vision response — but deliberately leave `elements` empty so
@@ -2419,13 +2514,7 @@ class CuaDriverBackend(ComputerUseBackend):
                 )
                 try:
                     cli_out = self._session._call_tool_via_cli(
-                        "get_window_state",
-                        {
-                            "pid": self._active_pid,
-                            "window_id": self._active_window_id,
-                            "session": self._session_id,
-                        },
-                        30.0,
+                        "get_window_state", self._gws_args(), 30.0,
                     )
                     if cli_out.get("isError") is True:
                         self._clear_active_target()
@@ -2437,15 +2526,10 @@ class CuaDriverBackend(ComputerUseBackend):
                         "cua-driver CLI re-fetch for vision screenshot failed: %s", cli_exc,
                     )
         else:
-            # get_window_state: AX tree + screenshot.
-            gws_out = self._call_capture_tool(
-                "get_window_state",
-                {
-                    "pid": self._active_pid,
-                    "window_id": self._active_window_id,
-                    "session": self._session_id,
-                },
-            )
+            # get_window_state: AX tree + screenshot. The validated structured view carries the
+            # tokens and frames semantic targeting needs; MCP and the CLI re-fetch share the args.
+            gws_args = self._gws_args(structured=True)
+            gws_out = self._call_capture_tool("get_window_state", gws_args)
             # The persistent MCP session can return a degenerate result —
             # empty/partial data with NO exception — when the bridge is flaky
             # (e.g. it reconnected mid-call and dropped the heavy
@@ -2476,13 +2560,7 @@ class CuaDriverBackend(ComputerUseBackend):
                 )
                 try:
                     cli_out = self._session._call_tool_via_cli(
-                        "get_window_state",
-                        {
-                            "pid": self._active_pid,
-                            "window_id": self._active_window_id,
-                            "session": self._session_id,
-                        },
-                        30.0,
+                        "get_window_state", gws_args, 30.0,
                     )
                     if cli_out.get("isError") is True:
                         self._clear_active_target()
@@ -2493,6 +2571,8 @@ class CuaDriverBackend(ComputerUseBackend):
                         "cua-driver CLI re-fetch for get_window_state failed: %s", cli_exc,
                     )
 
+            # Provenance follows the request that was ACTUALLY sent, not the MCP-era intent.
+            structured_view = "tree_format" in gws_args and not gws_out.get("cli_dropped_tree_format")
             text = gws_out["data"] if isinstance(gws_out["data"], str) else ""
             summary, tree = _split_tree_text(text)
 
@@ -2517,16 +2597,31 @@ class CuaDriverBackend(ComputerUseBackend):
                 for e in elements
                 if e.element_token
             }
+            # Verified-contract actions trust only exact-int rows of a validated structured request
+            # (bool indices alias int dict keys: an index a non-int row claims is dropped).
+            ambiguous = {e.index for e in elements if e.element_token and type(e.index) is not int}
+            self._exact_tokens = {
+                e.index: e.element_token for e in elements
+                if structured_view and e.element_token
+                and type(e.index) is int and e.index not in ambiguous
+            }
 
             # Image may arrive as an MCP image part or inside
             # structuredContent (screenshot_png_b64) depending on the driver
             # build — _image_from_tool_result handles both.
             png_b64, image_mime_type = _image_from_tool_result(gws_out)
 
-            # Extract window title from the AX tree first AXWindow line.
+            # Title from the first AXWindow line; only for the validated structured view fall
+            # back to the driver's window_title, then the AXWindow label.
             wt = re.search(r'AXWindow\s+"([^"]+)"', tree)
             if wt:
                 window_title = wt.group(1)
+            elif structured_view:
+                sc_title = (gws_out.get("structuredContent") or {}).get("window_title")
+                window_title = (
+                    sc_title if isinstance(sc_title, str) and sc_title
+                    else next((e.label for e in elements if e.role == "AXWindow" and e.label), "")
+                )
 
         png_bytes_len = 0
         if png_b64:
@@ -2755,6 +2850,12 @@ class CuaDriverBackend(ComputerUseBackend):
             "direction": direction,
             "amount": max(1, min(50, amount)),
         }
+        if (element is not None and self._active_window_id is None
+                and self._adapted("element_contract", "scroll")):
+            # Verified-contract element scroll must never fall through to a
+            # coordinate or bare-window scroll when its window is unknown.
+            return ActionResult(ok=False, action="scroll",
+                                message="No active window_id for element scroll.")
         if element is not None and self._active_window_id is not None:
             args["element_index"] = element
             args["window_id"] = self._active_window_id
@@ -3227,31 +3328,52 @@ class CuaDriverBackend(ComputerUseBackend):
         return self._session.call_tool(name, payload, timeout=timeout)
 
     # ── Internal ───────────────────────────────────────────────────
-    def _maybe_attach_element_token(self, tool: str, args: Dict[str, Any]) -> None:
-        """Surface 6: when the wrapper is about to call a token-capable
-        tool with `element_index`, look up the matching `element_token`
-        from the last snapshot and attach it. cua-driver-rs's contract
-        for combined args is documented in trycua/cua#1961:
+    def _adapted(self, method: str, *args: Any) -> bool:
+        """Session contract query as a strict bool (fakes/mocks: "not adapted")."""
+        probe = getattr(self._session, method, None)
+        return callable(probe) and probe(*args) is True
 
-          "element_token takes precedence over element_index when both
-           supplied. Returns an explicit 'stale' error if the snapshot
-           has been superseded."
+    def _maybe_attach_element_token(
+        self, tool: str, args: Dict[str, Any], *, inject_session: bool = True
+    ) -> Optional[ActionResult]:
+        """Surface 6: element-token handling for an `element_index` action.
 
-        Gated on the per-tool capability claim so we don't send the
-        field to drivers that predate the surface (which would reject
-        the schema with `additionalProperties: false`).
-        """
+        Verified Cua 0.36 contract (``element_contract``): the exact-int row's token from the
+        current validated capture replaces the index only if the COMPLETE outbound payload
+        validates; else a local ``stale_element`` refusal before dispatch.  A driver stale
+        verdict is the driver's own.  Everything else keeps the installed-baseline behaviour
+        (index stays; token beside it only with the advertised capability)."""
         idx = args.get("element_index")
+        if "element_index" in args and self._adapted("element_contract", tool):
+            token = None
+            if type(idx) is int:  # bool is an int subclass but never a valid index
+                token = self._exact_tokens.get(idx)
+                if token != self._snapshot_tokens.get(idx):
+                    token = None  # the cache was reset or replaced since that capture
+            if isinstance(token, str) and token:
+                payload = {k: v for k, v in args.items() if k != "element_index"}
+                payload["element_token"] = token
+                if inject_session:
+                    payload.setdefault("session", self._session_id)
+                if self._session.payload_verdict(tool, payload) is True:
+                    del args["element_index"]
+                    args["element_token"] = token
+                    return None
+            return ActionResult(
+                ok=False, action=tool, code="stale_element",
+                message=f"element {idx!r} has no usable token from the latest capture — call capture first",
+            )
         if not isinstance(idx, int):
-            return
+            return None
         token = self._snapshot_tokens.get(idx)
         if not token:
-            return
+            return None
         if not self._session.supports_capability(
             "accessibility.element_tokens", tool=tool
         ):
-            return
+            return None
         args["element_token"] = token
+        return None
 
     def _action(
         self,
@@ -3261,8 +3383,14 @@ class CuaDriverBackend(ComputerUseBackend):
         inject_session: bool = True,
     ) -> ActionResult:
         # Attach the snapshot's element_token whenever the call carries
-        # an element_index and the target tool advertises support.
-        self._maybe_attach_element_token(name, args)
+        # an element_index and the driver advertises the capability; a verified
+        # Cua 0.36 element action instead swaps the index for a validated token
+        # or is refused locally.
+        refusal = self._maybe_attach_element_token(
+            name, args, inject_session=inject_session
+        )
+        if refusal is not None:
+            return refusal
         # Carry this run's session id so the cua-driver agent cursor
         # and per-session state (config overrides, recording ownership)
         # stay tied to this run. setdefault preserves any explicit
