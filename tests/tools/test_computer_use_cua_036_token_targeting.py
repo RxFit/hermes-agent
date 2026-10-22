@@ -849,6 +849,77 @@ def test_the_validated_structured_request_keeps_the_title_fallback():
 
 
 # ---------------------------------------------------------------------------
+# CLI fallback provenance: structured-capture provenance belongs to the request that was ACTUALLY sent.
+# Two real routes reach the CLI helper: capture()'s empty-MCP-result re-fetch and the session's own
+# transient-MCP-error fallback.  Only the external transport is mocked.
+# ---------------------------------------------------------------------------
+
+_CLI_STRUCTURED = {**_ELEMENTS_RESPONSE["structuredContent"], "window_title": "CLI title",
+                   "screenshot_png_b64": "cG5n"}
+
+
+def _fallback_capture(monkeypatch: pytest.MonkeyPatch, kind: str, transport: str):
+    """kind: valid | invalid | unknown (verdict of the file-augmented CLI payload);
+    transport: refetch (empty MCP result) | implicit (transient MCP error inside session.call_tool)."""
+    schema = _real("get_window_state")
+    if kind == "invalid":
+        del schema["properties"]["screenshot_out_file"]  # the MCP request is VALID, the file-augmented one is not
+    backend = _backend({**_all_real(), "get_window_state": schema})
+    cli: list = []
+    files: list = []
+    _install_cli(monkeypatch, _CLI_STRUCTURED, cli, files)
+    if kind == "unknown":
+        _broken_validator(monkeypatch, when=lambda instance: "screenshot_out_file" in instance)
+    if transport == "refetch":
+        mcp = _mcp_requests(backend, _EMPTY)
+    else:
+        session = backend._session
+        session.__dict__.pop("call_tool", None)  # use the real session.call_tool
+        session._started = True
+        session._bridge = MagicMock()
+        session._bridge.run.side_effect = RuntimeError("os error 35: Resource temporarily unavailable")
+        session._call_tool_async = lambda name, args: None
+        mcp = session._bridge.run.call_args_list
+    return backend, mcp, cli, files
+
+
+@pytest.mark.parametrize("transport", ["refetch", "implicit"])
+@pytest.mark.parametrize("kind", ["invalid", "unknown"])
+def test_a_cli_request_that_lost_tree_format_confers_no_structured_provenance(monkeypatch, kind, transport):
+    backend, mcp, cli, files = _fallback_capture(monkeypatch, kind, transport)
+    cap = backend.capture("ax", pid=101, window_id=202)
+    assert len(mcp) == 1 and len(cli) == 1
+    if transport == "refetch":
+        assert mcp == [_C]  # the MCP-era request did carry the validated view
+    assert "screenshot_out_file" in cli[0] and _without_file(cli[0]) == _LG  # the actual request is baseline
+    # Baseline data survives: elements, snapshot cache and image.
+    assert [e.element_token for e in cap.elements] == ["s1234abcd:0", "s1234abcd:7"]
+    assert backend._snapshot_tokens == {0: "s1234abcd:0", 7: "s1234abcd:7"} and cap.png_b64 == "cG5n"
+    assert cap.window_title == ""  # baseline title: no structured fallback for a baseline request
+    # No recognised provenance: a recognised element action is refused with zero dispatch.
+    backend._session.call_tool = MagicMock(return_value=dict(_OK))
+    result = backend.click(element=7)
+    assert result.ok is False and result.code == "stale_element" and "capture" in result.message
+    backend._session.call_tool.assert_not_called()
+    assert all(not f.exists() for f in files)
+
+
+@pytest.mark.parametrize("transport", ["refetch", "implicit"])
+@pytest.mark.parametrize("index", [0, 7])
+def test_a_valid_cli_request_keeps_the_structured_view_title_and_exact_tokens(monkeypatch, transport, index):
+    backend, mcp, cli, files = _fallback_capture(monkeypatch, "valid", transport)
+    cap = backend.capture("ax", pid=101, window_id=202)
+    assert len(mcp) == 1 and len(cli) == 1
+    assert "screenshot_out_file" in cli[0] and _without_file(cli[0]) == _C  # complete CLI payload VALID
+    assert cap.window_title == "CLI title"
+    backend._session.call_tool = MagicMock(return_value=dict(_OK))
+    assert backend.click(element=index).ok is True
+    assert _sent(backend) == {"pid": 101, "button": "left", "window_id": 202,
+                              "element_token": f"s1234abcd:{index}", "session": _SID}
+    assert all(not f.exists() for f in files)
+
+
+# ---------------------------------------------------------------------------
 # Remote schema references are never retrieved.
 # ---------------------------------------------------------------------------
 

@@ -1619,15 +1619,16 @@ class _CuaDriverSession:
             fd, shot_file = _tempfile.mkstemp(prefix="cua_shot_", suffix=".png")
             os.close(fd)
             call_args["screenshot_out_file"] = shot_file
-        # The structured view was validated before the screenshot file existed.
-        # Revalidate the REAL request (session + file); unless VALID, drop only
-        # that added tree_format and keep the baseline screenshot-file transport.
+        # The structured view was validated before the screenshot file existed: revalidate the
+        # REAL request (session + file); unless VALID drop only that added tree_format.
+        dropped_tree_format = False
         if (
             name == "get_window_state"
             and "tree_format" in call_args
             and self.payload_verdict(name, call_args) is not True
         ):
             del call_args["tree_format"]
+            dropped_tree_format = True
 
         driver_command = resolve_cua_driver_cmd()
         if not driver_command:
@@ -1723,6 +1724,8 @@ class _CuaDriverSession:
                 "images": images,
                 "structuredContent": structured,
                 "isError": is_error,
+                # Our own marker, never driver-controlled: the sent request lacked the asked-for view.
+                **({"cli_dropped_tree_format": True} if dropped_tree_format else {}),
             }
         finally:
             if shot_file and os.path.exists(shot_file):
@@ -2523,9 +2526,8 @@ class CuaDriverBackend(ComputerUseBackend):
                         "cua-driver CLI re-fetch for vision screenshot failed: %s", cli_exc,
                     )
         else:
-            # get_window_state: AX tree + screenshot. The structured view (when
-            # the live schema accepts it) carries the tokens and frames that
-            # semantic targeting needs; MCP and the CLI re-fetch share the args.
+            # get_window_state: AX tree + screenshot. The validated structured view carries the
+            # tokens and frames semantic targeting needs; MCP and the CLI re-fetch share the args.
             gws_args = self._gws_args(structured=True)
             gws_out = self._call_capture_tool("get_window_state", gws_args)
             # The persistent MCP session can return a degenerate result —
@@ -2569,6 +2571,8 @@ class CuaDriverBackend(ComputerUseBackend):
                         "cua-driver CLI re-fetch for get_window_state failed: %s", cli_exc,
                     )
 
+            # Provenance follows the request that was ACTUALLY sent, not the MCP-era intent.
+            structured_view = "tree_format" in gws_args and not gws_out.get("cli_dropped_tree_format")
             text = gws_out["data"] if isinstance(gws_out["data"], str) else ""
             summary, tree = _split_tree_text(text)
 
@@ -2593,13 +2597,12 @@ class CuaDriverBackend(ComputerUseBackend):
                 for e in elements
                 if e.element_token
             }
-            # Verified-contract actions trust only exact-int rows of a validated structured
-            # request (the parser accepts bool indices, which alias int dict keys: an index
-            # claimed by a non-int row is ambiguous and dropped).  Rebuilt on every capture.
+            # Verified-contract actions trust only exact-int rows of a validated structured request
+            # (bool indices alias int dict keys: an index a non-int row claims is dropped).
             ambiguous = {e.index for e in elements if e.element_token and type(e.index) is not int}
             self._exact_tokens = {
                 e.index: e.element_token for e in elements
-                if "tree_format" in gws_args and e.element_token
+                if structured_view and e.element_token
                 and type(e.index) is int and e.index not in ambiguous
             }
 
@@ -2608,13 +2611,12 @@ class CuaDriverBackend(ComputerUseBackend):
             # build — _image_from_tool_result handles both.
             png_b64, image_mime_type = _image_from_tool_result(gws_out)
 
-            # Extract window title from the AX tree first AXWindow line. Only when
-            # this capture requested the validated structured view (no Markdown
-            # tree) fall back to the driver's window_title, then the AXWindow label.
+            # Title from the first AXWindow line; only for the validated structured view fall
+            # back to the driver's window_title, then the AXWindow label.
             wt = re.search(r'AXWindow\s+"([^"]+)"', tree)
             if wt:
                 window_title = wt.group(1)
-            elif "tree_format" in gws_args:
+            elif structured_view:
                 sc_title = (gws_out.get("structuredContent") or {}).get("window_title")
                 window_title = (
                     sc_title if isinstance(sc_title, str) and sc_title
@@ -3338,11 +3340,9 @@ class CuaDriverBackend(ComputerUseBackend):
 
         Verified Cua 0.36 contract (``element_contract``): the exact-int row's token from the
         current validated capture replaces the index only if the COMPLETE outbound payload
-        (ordinary fields + session) validates; otherwise a local ``stale_element`` refusal
-        before dispatch (never the forbidden index, never untargeted/coordinate input).  A
-        driver stale verdict is the driver's own response.  Everything else keeps the
-        installed-baseline behaviour (index stays; token beside it only with the advertised
-        ``accessibility.element_tokens`` capability)."""
+        validates; else a local ``stale_element`` refusal before dispatch.  A driver stale
+        verdict is the driver's own.  Everything else keeps the installed-baseline behaviour
+        (index stays; token beside it only with the advertised capability)."""
         idx = args.get("element_index")
         if "element_index" in args and self._adapted("element_contract", tool):
             token = None
